@@ -1,0 +1,9 @@
+flowchart TD
+    A([Terima order]) --> B{Stok cukup?}
+    B -->|ya| C[Reserve stok]
+    B -->|tidak| D[Backorder]
+    C --> E[Buat invoice]
+    E --> F{Bayar?}
+    F -->|lunas| G[(Simpan)]
+    F -->|gagal| D
+    G ==> H((Kirim))

@@ -1,0 +1,24 @@
+[package]
+name = "flowcli"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Render flowmaid diagrams in the terminal with ratatui — the renderer-agnostic scene API driving box- and line-drawing output."
+license = "GPL-3.0-or-later"
+repository = "https://github.com/go-routine-id/flowcli"
+
+[[bin]]
+name = "flowcli"
+path = "src/main.rs"
+
+[dependencies]
+# The engine: pure-std, zero-dep. We consume only its scene GEOMETRY
+# (no SVG) and re-draw it with box- and line-drawing characters.
+flowmaid = "0.18"
+# TUI toolkit. ratatui re-exports crossterm, so the interactive app
+# uses `ratatui::crossterm` and there's no separate version to pin.
+ratatui = "0.29"
+
+[profile.release]
+opt-level = "s"
+strip = "symbols"
