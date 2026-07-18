@@ -52,13 +52,16 @@ The only dependencies are `flowmaid` and `ratatui` — nothing else.
 
 ## Keybindings
 
-| Key            | Action                                                              |
+| Key / mouse    | Action                                                              |
 | -------------- | ------------------------------------------------------------------- |
 | `q` / `Esc`    | Quit                                                                |
+| **left-click** | Pick whatever is under the cursor — node, edge, or cluster          |
 | `Tab` / `→` `↓`| Focus the next node (dims everything else)                          |
 | `BackTab` / `←` `↑` | Focus the previous node                                        |
 | `c`            | Toggle the serpentine **compact** layout                            |
 | `r`            | Reload the `.mmd` file from disk                                     |
+
+Clicking runs the diagram's geometry through `Scene::hit_test` ([flowmaid #17](https://github.com/go-routine-id/flowmaid/issues/17)): the terminal cell is mapped back to a scene pixel and the engine reports the node, edge, or cluster under it — a node pick lights up focus, an edge or cluster shows in the title bar. Zoom/pan never enter the engine; the same picking API a web canvas would call drives a *pure-terminal* renderer, which is the whole point — if the geometry were wrong, the click would miss.
 
 Focus mode uses each node's `SceneNode.id` ([flowmaid #13](https://github.com/go-routine-id/flowmaid/issues/13)) to keep one node bright while dimming the rest — no re-layout, just a colour pass. Compact mode reflows a tall chain into a space-filling serpentine via `fold::scene_compact` ([flowmaid #15](https://github.com/go-routine-id/flowmaid/issues/15)):
 

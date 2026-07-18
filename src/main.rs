@@ -6,6 +6,8 @@
 //!
 //! Interactive keys: q quit · Tab/BackTab focus a node · c toggle
 //! compact (serpentine) layout · r reload the file.
+//! Mouse: left-click picks whatever is under the cursor — node (focus
+//! it), edge, or cluster — via the engine's `Scene::hit_test`.
 
 mod render;
 
@@ -19,6 +21,7 @@ struct App {
     src: String,
     compact: Option<f64>,
     focus: Option<usize>, // index into the current scene's node ids
+    pick: Option<String>, // last click readout for an edge/cluster hit
     scene: Scene,
     ids: Vec<String>,
     err: Option<String>,
@@ -35,6 +38,7 @@ impl App {
                     }
                 }
                 self.scene = sc;
+                self.pick = None; // indices change on rebuild
                 self.err = None;
             }
             Err(e) => self.err = Some(e),
@@ -101,6 +105,7 @@ fn main() {
         src,
         compact,
         focus: None,
+        pick: None,
         scene: Scene::empty(0.0, 0.0),
         ids: Vec::new(),
         err: None,
@@ -123,13 +128,22 @@ fn main() {
 }
 
 fn run(app: &mut App) -> std::io::Result<()> {
-    use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
-    use ratatui::layout::{Constraint, Layout};
+    use ratatui::crossterm::event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
+        MouseEventKind,
+    };
+    use ratatui::crossterm::execute;
+    use ratatui::layout::{Constraint, Layout, Rect};
     use ratatui::style::{Color, Modifier, Style};
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Block, Borders, Paragraph};
+    use flowmaid::scene::Hit;
 
     let mut term = ratatui::init();
+    let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    // The inner canvas rect from the last frame, so a click can be mapped
+    // back to scene pixels. Recomputed every draw (size may change).
+    let mut canvas_area: Option<Rect> = None;
     let result = loop {
         term.draw(|f| {
             let [top, body, help_row] = Layout::vertical([
@@ -148,7 +162,7 @@ fn run(app: &mut App) -> std::io::Result<()> {
                 Span::raw(format!(" {} ", app.path)),
                 Span::styled(
                     format!(
-                        "· {} nodes · {} edges{}{} ",
+                        "· {} nodes · {} edges{}{}{} ",
                         app.scene.nodes.len(),
                         app.scene.edges.len(),
                         if app.compact.is_some() {
@@ -157,6 +171,10 @@ fn run(app: &mut App) -> std::io::Result<()> {
                             ""
                         },
                         focus.map(|f| format!(" · focus: {f}")).unwrap_or_default(),
+                        app.pick
+                            .as_deref()
+                            .map(|p| format!(" · picked: {p}"))
+                            .unwrap_or_default(),
                     ),
                     Style::default().fg(Color::DarkGray),
                 ),
@@ -167,6 +185,7 @@ fn run(app: &mut App) -> std::io::Result<()> {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::DarkGray));
             let inner = canvas.inner(body);
+            canvas_area = Some(inner);
             f.render_widget(canvas, body);
             if let Some(e) = &app.err {
                 f.render_widget(
@@ -184,6 +203,8 @@ fn run(app: &mut App) -> std::io::Result<()> {
                 Span::raw(" quit  "),
                 Span::styled(" Tab ", keycap),
                 Span::raw(" focus node  "),
+                Span::styled(" click ", keycap),
+                Span::raw(" pick  "),
                 Span::styled(" c ", keycap),
                 Span::raw(" compact  "),
                 Span::styled(" r ", keycap),
@@ -194,37 +215,79 @@ fn run(app: &mut App) -> std::io::Result<()> {
         })?;
 
         if event::poll(Duration::from_millis(150))? {
-            if let Event::Key(k) = event::read()? {
-                if k.kind != KeyEventKind::Press {
-                    continue;
-                }
-                match k.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
-                    KeyCode::Tab | KeyCode::Right | KeyCode::Down => {
-                        app.focus = cycle(app.focus, app.ids.len(), 1);
-                    }
-                    KeyCode::BackTab | KeyCode::Left | KeyCode::Up => {
-                        app.focus = cycle(app.focus, app.ids.len(), -1);
-                    }
-                    KeyCode::Char('c') => {
-                        app.compact = if app.compact.is_some() {
-                            None
-                        } else {
-                            Some(220.0)
-                        };
-                        app.rebuild();
-                    }
-                    KeyCode::Char('r') => {
-                        if let Ok(s) = std::fs::read_to_string(&app.path) {
-                            app.src = s;
+            match event::read()? {
+                Event::Mouse(m) => {
+                    if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+                        if let Some(area) = canvas_area {
+                            match render::pick(&app.scene, area, m.column, m.row, &app.opts()) {
+                                // A node pick drives the existing focus/dim
+                                // highlight; the focus readout already names it.
+                                Some(Hit::Node(i)) => {
+                                    app.focus = Some(i);
+                                    app.pick = None;
+                                }
+                                Some(Hit::Edge(i)) => {
+                                    app.pick = app
+                                        .scene
+                                        .edges
+                                        .get(i)
+                                        .map(|e| format!("edge {}→{}", e.from, e.to));
+                                }
+                                Some(Hit::Cluster(i)) => {
+                                    app.pick = app.scene.clusters.get(i).map(|c| {
+                                        let name = if c.title.is_empty() {
+                                            c.id.as_str()
+                                        } else {
+                                            c.title.as_str()
+                                        };
+                                        format!("cluster {name}")
+                                    });
+                                }
+                                // Click on empty space clears the selection.
+                                None => {
+                                    app.focus = None;
+                                    app.pick = None;
+                                }
+                            }
                         }
-                        app.rebuild();
                     }
-                    _ => {}
                 }
+                Event::Key(k) => {
+                    if k.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    match k.code {
+                        KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
+                        KeyCode::Tab | KeyCode::Right | KeyCode::Down => {
+                            app.focus = cycle(app.focus, app.ids.len(), 1);
+                            app.pick = None;
+                        }
+                        KeyCode::BackTab | KeyCode::Left | KeyCode::Up => {
+                            app.focus = cycle(app.focus, app.ids.len(), -1);
+                            app.pick = None;
+                        }
+                        KeyCode::Char('c') => {
+                            app.compact = if app.compact.is_some() {
+                                None
+                            } else {
+                                Some(220.0)
+                            };
+                            app.rebuild();
+                        }
+                        KeyCode::Char('r') => {
+                            if let Ok(s) = std::fs::read_to_string(&app.path) {
+                                app.src = s;
+                            }
+                            app.rebuild();
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
             }
         }
     };
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }
@@ -302,6 +365,31 @@ mod tests {
             "focused node stays bright"
         );
         assert_eq!(buf[(ax, ay)].fg, Color::DarkGray, "unfocused node dims");
+    }
+
+    #[test]
+    fn click_picks_the_node_under_the_cursor() {
+        use flowmaid::scene::Hit;
+        use ratatui::layout::Rect;
+        let sc = build("flowchart LR\nA[Alpha] --> B[Beta] --> C[Gamma]", None).unwrap();
+        let area = Rect::new(0, 0, 80, 24);
+        let opts = Opts::default();
+        // Aim at each node's centre cell via the SAME transform draw uses;
+        // hit_test must return that node — proving screen→scene picking
+        // lines up with what was drawn.
+        let (sx, sy) = render::scale(&sc, area.width, area.height, &opts);
+        for (i, n) in sc.nodes.iter().enumerate() {
+            let col = area.x + (n.x / sx).round() as u16;
+            let row = area.y + (n.y / sy).round() as u16;
+            assert_eq!(
+                render::pick(&sc, area, col, row, &opts),
+                Some(Hit::Node(i)),
+                "node {} at cell ({col},{row})",
+                n.id
+            );
+        }
+        // A far corner is empty space → no pick, and focus clears.
+        assert_eq!(render::pick(&sc, area, 79, 23, &opts), None);
     }
 
     #[test]

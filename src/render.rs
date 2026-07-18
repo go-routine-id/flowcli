@@ -118,8 +118,7 @@ pub fn draw(buf: &mut Buffer, area: Rect, scene: &Scene, opts: &Opts) {
 
     // Fit the whole diagram into the area: scale so it never overflows,
     // but never magnify past the requested cell size.
-    let sx = (scene.width / cols as f64).max(opts.sx);
-    let sy = (scene.height / rows as f64).max(opts.sy);
+    let (sx, sy) = scale(scene, area.width, area.height, opts);
     let cx = |x: f64| (x / sx).round() as i64;
     let cy = |y: f64| (y / sy).round() as i64;
     let dim = opts.highlight.is_some();
@@ -296,6 +295,40 @@ pub fn draw(buf: &mut Buffer, area: Rect, scene: &Scene, opts: &Opts) {
             }
         }
     }
+}
+
+/// Pixels-per-cell used to fit `scene` into an `area` of `cols`×`rows`
+/// cells: scale down so it never overflows, but never magnify past the
+/// requested cell size. `draw` and [`pick`] MUST share this so a screen
+/// click lands on the same scene pixel that was drawn there.
+pub fn scale(scene: &Scene, cols: u16, rows: u16, opts: &Opts) -> (f64, f64) {
+    let sx = (scene.width / cols.max(1) as f64).max(opts.sx);
+    let sy = (scene.height / rows.max(1) as f64).max(opts.sy);
+    (sx, sy)
+}
+
+/// Map a terminal cell back to scene space and pick what's under it.
+///
+/// This is the inverse of `draw`'s `cx`/`cy`: a scene point `x` is drawn
+/// at cell `round(x / sx)`, so the scene point at the centre of cell `c`
+/// is `c * sx`. `col`/`row` are absolute terminal coordinates and `area`
+/// is the inner canvas rect the scene was drawn into. Returns `None`
+/// outside the canvas or on empty space. Zoom/pan never enter the crate —
+/// this is the whole screen→scene bridge, and [`flowmaid::scene::Scene::hit_test`]
+/// does the geometry.
+pub fn pick(scene: &Scene, area: Rect, col: u16, row: u16, opts: &Opts) -> Option<flowmaid::scene::Hit> {
+    if col < area.x || row < area.y {
+        return None;
+    }
+    let (lc, lr) = (col - area.x, row - area.y);
+    if lc >= area.width || lr >= area.height {
+        return None;
+    }
+    let (sx, sy) = scale(scene, area.width, area.height, opts);
+    let x = lc as f64 * sx;
+    let y = lr as f64 * sy;
+    // One cell of slack so thin edges are still clickable on a coarse grid.
+    scene.hit_test(x, y, sx.max(sy))
 }
 
 /// The polyline a terminal should trace for one edge: its routed
