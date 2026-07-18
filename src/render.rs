@@ -307,16 +307,14 @@ pub fn scale(scene: &Scene, cols: u16, rows: u16, opts: &Opts) -> (f64, f64) {
     (sx, sy)
 }
 
-/// Map a terminal cell back to scene space and pick what's under it.
-///
-/// This is the inverse of `draw`'s `cx`/`cy`: a scene point `x` is drawn
-/// at cell `round(x / sx)`, so the scene point at the centre of cell `c`
-/// is `c * sx`. `col`/`row` are absolute terminal coordinates and `area`
-/// is the inner canvas rect the scene was drawn into. Returns `None`
-/// outside the canvas or on empty space. Zoom/pan never enter the crate —
-/// this is the whole screen→scene bridge, and [`flowmaid::scene::Scene::hit_test`]
-/// does the geometry.
-pub fn pick(scene: &Scene, area: Rect, col: u16, row: u16, opts: &Opts) -> Option<flowmaid::scene::Hit> {
+/// Map a terminal cell back to a scene pixel. Inverse of `draw`'s
+/// `cx`/`cy`: a scene point `x` is drawn at cell `round(x / sx)`, so the
+/// scene point at the centre of cell `c` is `c * sx`. `col`/`row` are
+/// absolute terminal coordinates and `area` is the inner canvas rect the
+/// scene was drawn into. `None` outside the canvas. Zoom/pan never enter
+/// the crate — this is the whole screen→scene bridge (drives both picking
+/// and drag).
+pub fn to_scene(scene: &Scene, area: Rect, col: u16, row: u16, opts: &Opts) -> Option<(f64, f64)> {
     if col < area.x || row < area.y {
         return None;
     }
@@ -325,8 +323,15 @@ pub fn pick(scene: &Scene, area: Rect, col: u16, row: u16, opts: &Opts) -> Optio
         return None;
     }
     let (sx, sy) = scale(scene, area.width, area.height, opts);
-    let x = lc as f64 * sx;
-    let y = lr as f64 * sy;
+    Some((lc as f64 * sx, lr as f64 * sy))
+}
+
+/// Pick whatever the terminal cell sits over, via
+/// [`flowmaid::scene::Scene::hit_test`]. `None` outside the canvas or on
+/// empty space.
+pub fn pick(scene: &Scene, area: Rect, col: u16, row: u16, opts: &Opts) -> Option<flowmaid::scene::Hit> {
+    let (x, y) = to_scene(scene, area, col, row, opts)?;
+    let (sx, sy) = scale(scene, area.width, area.height, opts);
     // One cell of slack so thin edges are still clickable on a coarse grid.
     scene.hit_test(x, y, sx.max(sy))
 }

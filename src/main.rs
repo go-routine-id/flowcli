@@ -7,14 +7,41 @@
 //! Interactive keys: q quit · Tab/BackTab focus a node · c toggle
 //! compact (serpentine) layout · r reload the file.
 //! Mouse: left-click picks whatever is under the cursor — node (focus
-//! it), edge, or cluster — via the engine's `Scene::hit_test`.
+//! it), edge, or cluster — via the engine's `Scene::hit_test`; drag a
+//! node to move it, edges re-route live via `route_partial` (flowchart
+//! and state diagrams).
 
 mod render;
 
-use flowmaid::model::Document;
+use flowmaid::model::{Document, Graph};
 use flowmaid::scene::Scene;
 use render::Opts;
 use std::time::Duration;
+
+/// The parsed diagram. `Graph` diagrams (flowchart/state, non-compact)
+/// keep their source graph so nodes can be dragged and re-routed live via
+/// `route_partial`; everything else is a static `Plain` scene.
+enum Built {
+    Graph { g: Graph, scene: Scene },
+    Plain(Scene),
+}
+
+/// Drag state for a graph diagram: the moving node plus its base routing,
+/// so `route_partial` re-routes only the edges the drag touches.
+struct GraphState {
+    g: Graph,
+    base: Scene,
+    base_centers: Vec<(f64, f64)>,
+    centers: Vec<(f64, f64)>, // current centres (mutated while dragging)
+}
+
+/// An in-progress node drag.
+struct Drag {
+    node: usize,
+    /// Centre-minus-grab offset in scene px, so the node tracks the cursor
+    /// from where it was actually grabbed instead of snapping its centre to it.
+    off: (f64, f64),
+}
 
 struct App {
     path: String,
@@ -24,20 +51,38 @@ struct App {
     pick: Option<String>, // last click readout for an edge/cluster hit
     scene: Scene,
     ids: Vec<String>,
+    graph: Option<GraphState>, // present ⇒ draggable
+    drag: Option<Drag>,
     err: Option<String>,
 }
 
 impl App {
     fn rebuild(&mut self) {
         match build(&self.src, self.compact) {
-            Ok(sc) => {
-                self.ids = sc.nodes.iter().map(|n| n.id.clone()).collect();
+            Ok(built) => {
+                let (scene, graph) = match built {
+                    Built::Graph { g, scene } => {
+                        let centers: Vec<(f64, f64)> =
+                            scene.nodes.iter().map(|n| (n.x, n.y)).collect();
+                        let gs = GraphState {
+                            g,
+                            base: scene.clone(),
+                            base_centers: centers.clone(),
+                            centers,
+                        };
+                        (scene, Some(gs))
+                    }
+                    Built::Plain(scene) => (scene, None),
+                };
+                self.ids = scene.nodes.iter().map(|n| n.id.clone()).collect();
                 if let Some(f) = self.focus {
                     if f >= self.ids.len() {
                         self.focus = None;
                     }
                 }
-                self.scene = sc;
+                self.scene = scene;
+                self.graph = graph;
+                self.drag = None;
                 self.pick = None; // indices change on rebuild
                 self.err = None;
             }
@@ -50,22 +95,41 @@ impl App {
             ..Opts::default()
         }
     }
+    /// Move `node` so its centre sits at scene point `(x, y)` shifted by the
+    /// grab `off`, re-routing only the edges the move touches. No-op for
+    /// non-graph (ER/class/compact) diagrams, which carry no source graph.
+    fn drag_node(&mut self, node: usize, x: f64, y: f64, off: (f64, f64)) {
+        if let Some(gs) = &mut self.graph {
+            if node < gs.centers.len() {
+                gs.centers[node] = (x + off.0, y + off.1);
+                self.scene = flowmaid::scene::route_partial(
+                    &gs.g,
+                    &gs.centers,
+                    &gs.base,
+                    &gs.base_centers,
+                );
+            }
+        }
+    }
 }
 
-/// Parse a source and pick the scene, honouring `--compact`. Only the
-/// graph-shaped types carry the rich node/edge scene; ER and class ride
-/// the same geometry, so they render too.
-fn build(mmd: &str, compact: Option<f64>) -> Result<Scene, String> {
+/// Parse a source and build a drawable scene, honouring `--compact`. Only
+/// non-compact flowchart/state diagrams stay `Graph` (and so draggable);
+/// compact folds and ER/class ride the same geometry but as static scenes.
+fn build(mmd: &str, compact: Option<f64>) -> Result<Built, String> {
     match flowmaid::parser::parse_document(mmd).map_err(|e| e.to_string())? {
         Document::Flowchart(g) | Document::State(g) => Ok(match compact {
-            Some(px) => {
+            Some(px) => Built::Plain(
                 flowmaid::fold::scene_compact(&g, &flowmaid::fold::CompactOptions::for_extent(px))
-                    .scene
+                    .scene,
+            ),
+            None => {
+                let scene = flowmaid::scene::scene(&g);
+                Built::Graph { g, scene }
             }
-            None => flowmaid::scene::scene(&g),
         }),
-        Document::Er(d) => Ok(flowmaid::er::scene(&d).scene),
-        Document::Class(d) => Ok(flowmaid::class::scene(&d).scene),
+        Document::Er(d) => Ok(Built::Plain(flowmaid::er::scene(&d).scene)),
+        Document::Class(d) => Ok(Built::Plain(flowmaid::class::scene(&d).scene)),
         _ => Err("this diagram type isn't drawable in the terminal yet \
                   (flowchart, state, ER and class are)"
             .into()),
@@ -108,6 +172,8 @@ fn main() {
         pick: None,
         scene: Scene::empty(0.0, 0.0),
         ids: Vec::new(),
+        graph: None,
+        drag: None,
         err: None,
     };
     app.rebuild();
@@ -205,6 +271,8 @@ fn run(app: &mut App) -> std::io::Result<()> {
                 Span::raw(" focus node  "),
                 Span::styled(" click ", keycap),
                 Span::raw(" pick  "),
+                Span::styled(" drag ", keycap),
+                Span::raw(" move node  "),
                 Span::styled(" c ", keycap),
                 Span::raw(" compact  "),
                 Span::styled(" r ", keycap),
@@ -217,14 +285,32 @@ fn run(app: &mut App) -> std::io::Result<()> {
         if event::poll(Duration::from_millis(150))? {
             match event::read()? {
                 Event::Mouse(m) => {
-                    if let MouseEventKind::Down(MouseButton::Left) = m.kind {
-                        if let Some(area) = canvas_area {
+                    let Some(area) = canvas_area else { continue };
+                    match m.kind {
+                        MouseEventKind::Down(MouseButton::Left) => {
                             match render::pick(&app.scene, area, m.column, m.row, &app.opts()) {
                                 // A node pick drives the existing focus/dim
-                                // highlight; the focus readout already names it.
+                                // highlight AND grabs the node for dragging
+                                // (graph diagrams only — else it just focuses).
                                 Some(Hit::Node(i)) => {
                                     app.focus = Some(i);
                                     app.pick = None;
+                                    if app.graph.is_some() {
+                                        let off = app
+                                            .graph
+                                            .as_ref()
+                                            .and_then(|gs| gs.centers.get(i).copied())
+                                            .zip(render::to_scene(
+                                                &app.scene,
+                                                area,
+                                                m.column,
+                                                m.row,
+                                                &app.opts(),
+                                            ))
+                                            .map(|(c, p)| (c.0 - p.0, c.1 - p.1))
+                                            .unwrap_or((0.0, 0.0));
+                                        app.drag = Some(Drag { node: i, off });
+                                    }
                                 }
                                 Some(Hit::Edge(i)) => {
                                     app.pick = app
@@ -250,6 +336,19 @@ fn run(app: &mut App) -> std::io::Result<()> {
                                 }
                             }
                         }
+                        // Live drag: move the grabbed node under the cursor
+                        // and re-route only its edges.
+                        MouseEventKind::Drag(MouseButton::Left) => {
+                            if let Some(d) = app.drag.as_ref().map(|d| (d.node, d.off)) {
+                                if let Some((x, y)) =
+                                    render::to_scene(&app.scene, area, m.column, m.row, &app.opts())
+                                {
+                                    app.drag_node(d.0, x, y, d.1);
+                                }
+                            }
+                        }
+                        MouseEventKind::Up(MouseButton::Left) => app.drag = None,
+                        _ => {}
                     }
                 }
                 Event::Key(k) => {
@@ -309,13 +408,19 @@ fn cycle(cur: Option<usize>, len: usize, dir: i64) -> Option<usize> {
 mod tests {
     use super::*;
 
+    /// Just the scene, regardless of whether it stayed a draggable graph.
+    fn scene_of(mmd: &str, compact: Option<f64>) -> Scene {
+        match build(mmd, compact).unwrap() {
+            Built::Graph { scene, .. } | Built::Plain(scene) => scene,
+        }
+    }
+
     #[test]
     fn renders_a_flowchart_to_box_and_line_drawing() {
-        let sc = build(
+        let sc = scene_of(
             "flowchart TD\nA[Start] --> B{OK?}\nB -->|yes| C[Go]\nB -->|no| A",
             None,
-        )
-        .unwrap();
+        );
         let out = render::preview(&sc, 80, 24, &Opts::default());
         // Node ids all appear as labels, box corners and an arrow drawn.
         assert!(out.contains("Start") && out.contains("OK?") && out.contains("Go"));
@@ -332,7 +437,7 @@ mod tests {
         use ratatui::backend::TestBackend;
         use ratatui::style::Color;
         use ratatui::Terminal;
-        let sc = build("flowchart LR\nA --> B --> C", None).unwrap();
+        let sc = scene_of("flowchart LR\nA --> B --> C", None);
         // Dimming is a COLOUR change (invisible in a plain-text dump),
         // so inspect the buffer: with B focused, every non-DarkGray
         // foreground belongs to B's cells; A and C go DarkGray.
@@ -371,7 +476,7 @@ mod tests {
     fn click_picks_the_node_under_the_cursor() {
         use flowmaid::scene::Hit;
         use ratatui::layout::Rect;
-        let sc = build("flowchart LR\nA[Alpha] --> B[Beta] --> C[Gamma]", None).unwrap();
+        let sc = scene_of("flowchart LR\nA[Alpha] --> B[Beta] --> C[Gamma]", None);
         let area = Rect::new(0, 0, 80, 24);
         let opts = Opts::default();
         // Aim at each node's centre cell via the SAME transform draw uses;
@@ -398,10 +503,46 @@ mod tests {
         for i in 0..13 {
             src.push_str(&format!("N{i} --> N{}\n", i + 1));
         }
-        let tall = build(&src, None).unwrap();
-        let folded = build(&src, Some(200.0)).unwrap();
+        let tall = scene_of(&src, None);
+        let folded = scene_of(&src, Some(200.0));
         // Folding trades height for width, same node/edge count.
         assert_eq!(tall.nodes.len(), folded.nodes.len());
         assert!(folded.width > tall.width && folded.height < tall.height);
+    }
+
+    #[test]
+    fn dragging_a_node_reroutes_only_its_own_edges() {
+        // A graph diagram keeps its source graph, so a drag can re-route
+        // via route_partial — the second half of pick → drag → route.
+        let Built::Graph { g, scene } = build("flowchart TD\nA --> B --> C", None).unwrap() else {
+            panic!("flowchart should stay a draggable graph");
+        };
+        let base_centers: Vec<(f64, f64)> = scene.nodes.iter().map(|n| (n.x, n.y)).collect();
+        let mut centers = base_centers.clone();
+        // Shove B sideways by 200px and re-route.
+        centers[1].0 += 200.0;
+        let moved = flowmaid::scene::route_partial(&g, &centers, &scene, &base_centers);
+        assert_eq!(moved.nodes.len(), scene.nodes.len());
+        // B moved ~200px relative to A (compare deltas so any global
+        // canvas shift inside route_partial cancels out)...
+        let base_rel = scene.nodes[1].x - scene.nodes[0].x;
+        let moved_rel = moved.nodes[1].x - moved.nodes[0].x;
+        assert!(
+            (moved_rel - base_rel - 200.0).abs() < 1.0,
+            "B should track the drag"
+        );
+        // ...while A and C keep their relative position (untouched by the move).
+        let base_ac = scene.nodes[2].x - scene.nodes[0].x;
+        let moved_ac = moved.nodes[2].x - moved.nodes[0].x;
+        assert!((moved_ac - base_ac).abs() < 1.0, "unmoved nodes stay put");
+    }
+
+    #[test]
+    fn er_diagrams_are_not_draggable() {
+        // ER rides different geometry with no source graph → no drag.
+        assert!(matches!(
+            build("erDiagram\n a ||--o{ b : has", None).unwrap(),
+            Built::Plain(_)
+        ));
     }
 }
