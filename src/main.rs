@@ -141,14 +141,21 @@ fn run(app: &mut App) -> std::io::Result<()> {
 
             let focus = app.focus.and_then(|i| app.ids.get(i)).cloned();
             let title = Line::from(vec![
-                Span::styled(" flowcli ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+                Span::styled(
+                    " flowcli ",
+                    Style::default().fg(Color::Black).bg(Color::Cyan),
+                ),
                 Span::raw(format!(" {} ", app.path)),
                 Span::styled(
                     format!(
                         "· {} nodes · {} edges{}{} ",
                         app.scene.nodes.len(),
                         app.scene.edges.len(),
-                        if app.compact.is_some() { " · compact" } else { "" },
+                        if app.compact.is_some() {
+                            " · compact"
+                        } else {
+                            ""
+                        },
                         focus.map(|f| format!(" · focus: {f}")).unwrap_or_default(),
                     ),
                     Style::default().fg(Color::DarkGray),
@@ -156,14 +163,15 @@ fn run(app: &mut App) -> std::io::Result<()> {
             ]);
             f.render_widget(Paragraph::new(title), top);
 
-            let canvas = Block::default().borders(Borders::ALL).border_style(
-                Style::default().fg(Color::DarkGray),
-            );
+            let canvas = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray));
             let inner = canvas.inner(body);
             f.render_widget(canvas, body);
             if let Some(e) = &app.err {
                 f.render_widget(
-                    Paragraph::new(format!("parse error: {e}")).style(Style::default().fg(Color::Red)),
+                    Paragraph::new(format!("parse error: {e}"))
+                        .style(Style::default().fg(Color::Red)),
                     inner,
                 );
             } else {
@@ -240,8 +248,11 @@ mod tests {
 
     #[test]
     fn renders_a_flowchart_to_box_and_line_drawing() {
-        let sc = build("flowchart TD\nA[Start] --> B{OK?}\nB -->|yes| C[Go]\nB -->|no| A", None)
-            .unwrap();
+        let sc = build(
+            "flowchart TD\nA[Start] --> B{OK?}\nB -->|yes| C[Go]\nB -->|no| A",
+            None,
+        )
+        .unwrap();
         let out = render::preview(&sc, 80, 24, &Opts::default());
         // Node ids all appear as labels, box corners and an arrow drawn.
         assert!(out.contains("Start") && out.contains("OK?") && out.contains("Go"));
@@ -279,13 +290,17 @@ mod tests {
         let buf = term.backend().buffer().clone();
         // The label 'B' cell keeps a bright colour; 'A' is dimmed.
         let find = |ch: char| {
-            (0..20).flat_map(|y| (0..80).map(move |x| (x, y))).find(|&(x, y)| {
-                buf[(x, y)].symbol() == ch.to_string()
-            })
+            (0..20)
+                .flat_map(|y| (0..80).map(move |x| (x, y)))
+                .find(|&(x, y)| buf[(x, y)].symbol() == ch.to_string())
         };
         let (bx, by) = find('B').expect("B drawn");
         let (ax, ay) = find('A').expect("A drawn");
-        assert_ne!(buf[(bx, by)].fg, Color::DarkGray, "focused node stays bright");
+        assert_ne!(
+            buf[(bx, by)].fg,
+            Color::DarkGray,
+            "focused node stays bright"
+        );
         assert_eq!(buf[(ax, ay)].fg, Color::DarkGray, "unfocused node dims");
     }
 

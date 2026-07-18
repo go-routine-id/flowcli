@@ -1,19 +1,119 @@
 # flowcli
 
-Render [flowmaid](https://crates.io/crates/flowmaid) diagrams **in the terminal** with [ratatui](https://ratatui.rs) — a proof that flowmaid's scene API is renderer-agnostic: no SVG, just plain geometry redrawn with Unicode box- and line-drawing characters.
+**Render [flowmaid](https://github.com/go-routine-id/flowmaid) diagrams right in your terminal — no SVG, no browser, just Unicode box- and line-drawing.**
 
-```sh
-flowcli diagram.mmd            # interactive
-flowcli diagram.mmd --preview  # print once (headless) and exit
-flowcli diagram.mmd --compact 200
+flowcli is a [ratatui](https://ratatui.rs) front-end for the flowmaid diagram engine. It exists to prove one thing: flowmaid's `scene` API is **renderer-agnostic**. The engine hands out plain geometry — node rectangles, edge polylines, cluster boxes, labels — and never assumes SVG. flowcli takes that same geometry and paints it onto a character grid. One ~350-line adapter, and the very diagrams you'd export to SVG appear as `╭─╮ │ ╰─╯` in your shell.
+
+```text
+           ╭─────────────╮
+           │Terima order │
+           ╰─────────────╯
+                  │
+         ┌────────▼─────────┐
+         │   Stok cukup?    │
+         └──────────────────┘
+               ╭╯      ╰╮
+             ╭─╯        ╰╮
+   ┌─────────◀───┐       ╰╮
+   │Reserve stok │        │
+   └─────────────┘        │
+          │               │
+    ┌─────▼─────┐         │
+    │Buat invoic│         │
+    └───────────┘         │
+          │               │
+   ┌──────◀─────┐         │
+   │   Bayar?   │         │
+   └────────────┘         │
+          │     ╰────╮    │
+     ┌────▼────┐     ╰╮   │
+     │ Simpan  │     ┌▶───▼─────┐
+     │         │     │Backorder │
+     └─────────┘     └──────────┘
+          │
+       ╭──▼──╮
+       │Kirim│
+       ╰─────╯
 ```
 
-Interactive keys: `q` quit · `Tab`/`BackTab` focus a node (dims the rest — uses `SceneNode.id`) · `c` toggle compact serpentine layout · `r` reload the file.
+*(Above: `flowcli examples.mmd --preview`. In a real terminal the boxes are true-colour — diamonds render yellow, cylinders blue, start/stop nodes green — and arrowheads point along the flow.)*
+
+## Install & run
+
+```sh
+git clone https://github.com/go-routine-id/flowcli
+cd flowcli
+cargo run --release -- examples.mmd            # interactive TUI
+cargo run --release -- examples.mmd --preview  # print once (headless) and exit
+cargo run --release -- examples/pipeline.mmd --compact 200
+```
+
+The only dependencies are `flowmaid` and `ratatui` — nothing else.
+
+## Keybindings
+
+| Key            | Action                                                              |
+| -------------- | ------------------------------------------------------------------- |
+| `q` / `Esc`    | Quit                                                                |
+| `Tab` / `→` `↓`| Focus the next node (dims everything else)                          |
+| `BackTab` / `←` `↑` | Focus the previous node                                        |
+| `c`            | Toggle the serpentine **compact** layout                            |
+| `r`            | Reload the `.mmd` file from disk                                     |
+
+Focus mode uses each node's `SceneNode.id` ([flowmaid #13](https://github.com/go-routine-id/flowmaid/issues/13)) to keep one node bright while dimming the rest — no re-layout, just a colour pass. Compact mode reflows a tall chain into a space-filling serpentine via `fold::scene_compact` ([flowmaid #15](https://github.com/go-routine-id/flowmaid/issues/15)):
+
+```text
+                  ╭──────────╮────────╮───────────╮───────────╮──────────╮────────╮─────────╮
+                  │          │        │           │           │          │        │         │
+    ┌────┐    ┌────────┐  ┌──▼──┐  ┌──▼───┐  ┌────▼────┐  ┌───▼────┐  ┌──▼───┐  ┌─▼─┐   ┌───▼────┐   ┌─────┐
+    │Clon│    │Format c│  │Clipp│  │Unit t│  │Integrati│  │Build re│  │Packag│  │Sig│   │Upload a│   │Publi│
+    └────┘    └───▲────┘  └─────┘  └──────┘  └─────────┘  └────────┘  └──────┘  └───┘   └────────┘   └──▲──┘
+      │           │                                                                         │           │
+  ┌───▼────┐      │                                                                         │       ┌───────┐
+  │Restore │      │                                                                         │       │Smoke t│
+  └────────┘      │                                                                         │       └───▲───┘
+      │           │                                                                         │           │
+      ╰───────────╯                                                                         ╰───────────╯
+```
+
+*(`flowcli examples/pipeline.mmd --compact 200 --preview` — a 12-step pipeline that would otherwise scroll off the bottom, folded to fit the width.)*
 
 ## How it works
 
-flowmaid gives `scene::scene(&graph)` → node rectangles, edge polylines (channel waypoints or bezier), cluster boxes, labels — all f64 pixels. `src/render.rs` maps those onto character cells: nodes become `╭─╮│╰─╯` boxes, edges become `├┼┴` line-drawing with `▶◀▲▼` arrowheads, and custom `style` colours (hex) become true-colour cells. flowmaid stays a zero-dependency library; flowcli is just one ~350-line adapter on top.
+flowmaid's `scene::scene(&graph)` returns a `Scene` of pure geometry in f64 pixels:
+
+- **node rectangles** (`x, y, w, h`, a `Shape`, an `id`, and optional hex `style`),
+- **edge polylines** — routed channel `waypoints` when present, otherwise a cubic `bezier` to sample,
+- **cluster boxes** and **labels**.
+
+flowcli's `src/render.rs` maps that onto a terminal cell grid. Because terminal cells are about twice as tall as they are wide, it scales the two axes independently (`sy ≈ 2·sx`) to keep the diagram's proportions. Then:
+
+1. **Cluster boxes** are drawn first, behind everything.
+2. **Edges** are walked cell-by-cell; each step records connection bits (up/down/left/right) so a later pass can bake real junctions — `├ ┼ ┴ ╮` — instead of dumb crossings.
+3. **Node boxes** are stamped on top with `┌─┐ │ └─┘` (square) or `╭─╮ │ ╰─╯` (rounded, for stadium/circle shapes), then their labels centred inside.
+4. **Arrowheads** (`▶ ◀ ▲ ▼`) land last, on the last polyline cell outside the target box, pointing at it.
+5. Custom `style` strokes/colours (`#rrggbb`) become **true-colour** cells.
+
+That is the entire adapter. It never touches SVG, never re-implements layout — it consumes the same `Scene` the SVG backend does. That is the point: **the engine produces geometry; renderers are interchangeable.** flowmaid stays a zero-dependency library; flowcli is the ~350 lines that turn its geometry into text.
+
+The whole thing is verifiable **without a TTY**: `render::preview` (and the `--preview` flag) draw into ratatui's `TestBackend` and return the grid as a plain string, so every example in this README — and the test suite — renders headlessly.
+
+## Examples
+
+| File                   | Type       |
+| ---------------------- | ---------- |
+| `examples.mmd`         | flowchart  |
+| `examples/pipeline.mmd`| flowchart (long chain, good for `--compact`) |
+| `examples/state.mmd`   | state machine |
+| `examples/er.mmd`      | ER diagram |
+
+flowcli draws flowchart, state, ER and class diagrams — every flowmaid type whose scene carries node/edge geometry.
+
+## The flowmaid family
+
+- **[flowmaid](https://github.com/go-routine-id/flowmaid)** — the zero-dependency diagram engine ([crates.io](https://crates.io/crates/flowmaid))
+- **flowcli** — this: the terminal renderer
 
 ## License
 
-GPL-3.0-or-later — same as flowmaid.
+GPL-3.0-or-later — same as the rest of the flowmaid family.

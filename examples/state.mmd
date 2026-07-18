@@ -1,0 +1,7 @@
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> Validating : submit
+    Validating --> Rejected : invalid
+    Validating --> Done : valid
+    Rejected --> Idle : retry
+    Done --> [*]

@@ -1,0 +1,12 @@
+flowchart TD
+    A[Clone] --> B[Restore deps]
+    B --> C[Format check]
+    C --> D[Clippy]
+    D --> E[Unit tests]
+    E --> F[Integration tests]
+    F --> G[Build release]
+    G --> H[Package]
+    H --> I[Sign]
+    I --> J[Upload artifact]
+    J --> K[Smoke test]
+    K --> L[Publish]

@@ -1,0 +1,13 @@
+erDiagram
+    users ||--o{ posts : writes
+    posts }o--|| categories : in
+    users {
+        uuid id PK
+        varchar email UK
+        timestamp created_at
+    }
+    posts {
+        uuid id PK
+        uuid author_id FK
+        text body
+    }

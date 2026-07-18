@@ -129,7 +129,12 @@ pub fn draw(buf: &mut Buffer, area: Rect, scene: &Scene, opts: &Opts) {
         let (x0, y0) = (cx(cl.x), cy(cl.y));
         let (x1, y1) = (cx(cl.x + cl.w), cy(cl.y + cl.h));
         rect(&mut g, x0, y0, x1, y1, Color::DarkGray, false, false);
-        for (k, ch) in cl.title.chars().take((x1 - x0 - 2).max(0) as usize).enumerate() {
+        for (k, ch) in cl
+            .title
+            .chars()
+            .take((x1 - x0 - 2).max(0) as usize)
+            .enumerate()
+        {
             g.put(x0 + 2 + k as i64, y0, ch, Color::DarkGray, false);
         }
     }
@@ -173,7 +178,11 @@ pub fn draw(buf: &mut Buffer, area: Rect, scene: &Scene, opts: &Opts) {
             .map(|(x, y)| (cx(x), cy(y)))
             .collect();
         let faded = dim && !edge_touches(e, opts.highlight.as_deref());
-        let col = if faded { Color::DarkGray } else { edge_color(e, &by_id) };
+        let col = if faded {
+            Color::DarkGray
+        } else {
+            edge_color(e, &by_id)
+        };
         for w in pts.windows(2) {
             walk(&mut g, w[0], w[1]);
         }
@@ -187,9 +196,9 @@ pub fn draw(buf: &mut Buffer, area: Rect, scene: &Scene, opts: &Opts) {
             // Outside the INTERIOR of every node box, so an arrow never
             // lands on another node's label.
             let outside_all = |c: (i64, i64)| {
-                box_of.values().all(|&(x0, y0, x1, y1)| {
-                    c.0 <= x0 || c.0 >= x1 || c.1 <= y0 || c.1 >= y1
-                })
+                box_of
+                    .values()
+                    .all(|&(x0, y0, x1, y1)| c.0 <= x0 || c.0 >= x1 || c.1 <= y0 || c.1 >= y1)
             };
             if let Some(&anchor) = pts.iter().rev().find(|&&c| outside_all(c)) {
                 let target = tbox
@@ -229,7 +238,11 @@ pub fn draw(buf: &mut Buffer, area: Rect, scene: &Scene, opts: &Opts) {
     for n in &scene.nodes {
         let focus = opts.highlight.as_deref() == Some(n.id.as_str());
         let faded = dim && !focus;
-        let col = if faded { Color::DarkGray } else { node_color(n) };
+        let col = if faded {
+            Color::DarkGray
+        } else {
+            node_color(n)
+        };
         let (x0, y0, x1, y1) = box_of[n.id.as_str()];
         let rounded = matches!(
             n.shape,
@@ -241,7 +254,11 @@ pub fn draw(buf: &mut Buffer, area: Rect, scene: &Scene, opts: &Opts) {
                 g.put(c, r, ' ', col, false);
             }
         }
-        let text_col = if faded { Color::DarkGray } else { label_color(n) };
+        let text_col = if faded {
+            Color::DarkGray
+        } else {
+            label_color(n)
+        };
         let inner = (x1 - x0 - 1).max(0) as usize;
         let label = flowmaid::layout::spans(n.label.split('\n').next().unwrap_or(""))
             .into_iter()
@@ -293,8 +310,14 @@ fn edge_points(e: &flowmaid::scene::SceneEdge) -> Vec<(f64, f64)> {
             let t = i as f64 / 10.0;
             let u = 1.0 - t;
             (
-                u * u * u * p0.0 + 3.0 * u * u * t * p1.0 + 3.0 * u * t * t * p2.0 + t * t * t * p3.0,
-                u * u * u * p0.1 + 3.0 * u * u * t * p1.1 + 3.0 * u * t * t * p2.1 + t * t * t * p3.1,
+                u * u * u * p0.0
+                    + 3.0 * u * u * t * p1.0
+                    + 3.0 * u * t * t * p2.0
+                    + t * t * t * p3.0,
+                u * u * u * p0.1
+                    + 3.0 * u * u * t * p1.1
+                    + 3.0 * u * t * t * p2.1
+                    + t * t * t * p3.1,
             )
         })
         .collect()
