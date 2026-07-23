@@ -4,8 +4,9 @@
 //!   flowcli diagram.mmd --preview    # print once (headless) and exit
 //!   flowcli diagram.mmd --compact 200
 //!
-//! Interactive keys: q quit · Tab/BackTab focus a node · c toggle
-//! compact (serpentine) layout · r reload the file.
+//! Interactive keys: q quit · Tab/BackTab focus a node · s save the
+//! dragged layout to a `<file>.layout` sidecar (auto-loaded next open)
+//! · c toggle compact (serpentine) layout · r reload the file.
 //! Mouse: left-click picks whatever is under the cursor — node (focus
 //! it), edge, or cluster — via the engine's `Scene::hit_test`; drag a
 //! node to move it, edges re-route live via `route_partial` (flowchart
@@ -61,13 +62,24 @@ impl App {
         match build(&self.src, self.compact) {
             Ok(built) => {
                 let (scene, graph) = match built {
-                    Built::Graph { g, scene } => {
-                        let centers: Vec<(f64, f64)> =
-                            scene.nodes.iter().map(|n| (n.x, n.y)).collect();
+                    Built::Graph { g, scene: fresh } => {
+                        let ids: Vec<String> =
+                            fresh.nodes.iter().map(|n| n.id.clone()).collect();
+                        let base_centers: Vec<(f64, f64)> =
+                            fresh.nodes.iter().map(|n| (n.x, n.y)).collect();
+                        // Apply a saved layout sidecar over the fresh
+                        // auto-layout, then re-route the moved edges so
+                        // the diagram opens where it was last dragged.
+                        let mut centers = base_centers.clone();
+                        let scene = if load_layout(&layout_path(&self.path), &ids, &mut centers) {
+                            flowmaid::scene::route_partial(&g, &centers, &fresh, &base_centers)
+                        } else {
+                            fresh.clone()
+                        };
                         let gs = GraphState {
                             g,
-                            base: scene.clone(),
-                            base_centers: centers.clone(),
+                            base: fresh,
+                            base_centers,
                             centers,
                         };
                         (scene, Some(gs))
@@ -95,6 +107,28 @@ impl App {
             ..Opts::default()
         }
     }
+    /// Write the current node positions to `<path>.layout` so a dragged
+    /// arrangement survives across sessions. Mermaid has no syntax for
+    /// absolute positions, so this is a sidecar (`<id> <x> <y>` per line)
+    /// that `rebuild` reads back — the layout persists, the `.mmd` stays
+    /// canonical. No-op for non-graph diagrams (nothing to drag).
+    fn save_layout(&mut self) {
+        let Some(gs) = &self.graph else {
+            self.pick = Some("nothing to save — drag needs a flowchart/state diagram".into());
+            return;
+        };
+        let mut out = String::new();
+        for (i, id) in self.ids.iter().enumerate() {
+            if let Some(&(x, y)) = gs.centers.get(i) {
+                out.push_str(&format!("{id} {x} {y}\n"));
+            }
+        }
+        let p = layout_path(&self.path);
+        self.pick = Some(match std::fs::write(&p, out) {
+            Ok(()) => format!("saved layout → {p}"),
+            Err(e) => format!("save failed: {e}"),
+        });
+    }
     /// Move `node` so its centre sits at scene point `(x, y)` shifted by the
     /// grab `off`, re-routing only the edges the move touches. No-op for
     /// non-graph (ER/class/compact) diagrams, which carry no source graph.
@@ -111,6 +145,36 @@ impl App {
             }
         }
     }
+}
+
+/// The sidecar path for a diagram: `diagram.mmd` → `diagram.mmd.layout`.
+fn layout_path(path: &str) -> String {
+    format!("{path}.layout")
+}
+
+/// Read a `<id> <x> <y>` sidecar and overlay the saved positions onto
+/// `centers` (by node id, so it survives node reordering). Returns
+/// whether any position was applied; a missing or unreadable file is
+/// simply "no saved layout" (`false`), never an error.
+fn load_layout(path: &str, ids: &[String], centers: &mut [(f64, f64)]) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let mut applied = false;
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        if let (Some(id), Some(xs), Some(ys)) = (it.next(), it.next(), it.next()) {
+            if let (Ok(x), Ok(y), Some(i)) = (
+                xs.parse::<f64>(),
+                ys.parse::<f64>(),
+                ids.iter().position(|n| n == id),
+            ) {
+                centers[i] = (x, y);
+                applied = true;
+            }
+        }
+    }
+    applied
 }
 
 /// Parse a source and build a drawable scene, honouring `--compact`. Only
@@ -273,6 +337,8 @@ fn run(app: &mut App) -> std::io::Result<()> {
                 Span::raw(" pick  "),
                 Span::styled(" drag ", keycap),
                 Span::raw(" move node  "),
+                Span::styled(" s ", keycap),
+                Span::raw(" save layout  "),
                 Span::styled(" c ", keycap),
                 Span::raw(" compact  "),
                 Span::styled(" r ", keycap),
@@ -373,6 +439,7 @@ fn run(app: &mut App) -> std::io::Result<()> {
                             };
                             app.rebuild();
                         }
+                        KeyCode::Char('s') => app.save_layout(),
                         KeyCode::Char('r') => {
                             if let Ok(s) = std::fs::read_to_string(&app.path) {
                                 app.src = s;
@@ -407,6 +474,33 @@ fn cycle(cur: Option<usize>, len: usize, dir: i64) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn layout_sidecar_round_trips_dragged_positions() {
+        // load_layout overlays saved positions by node id, ignoring
+        // unknown ids and tolerating a missing file.
+        let ids = vec!["A".to_string(), "B".to_string()];
+        let mut centers = vec![(0.0, 0.0), (0.0, 0.0)];
+        // A saved sidecar written in the exact `save_layout` format.
+        let sidecar = format!("{} {} {}\n{} {} {}\n", "A", 12.5, 40.0, "B", 300.0, 180.0);
+        let dir = std::env::temp_dir();
+        let path = dir.join("flowcli_test_layout.mmd.layout");
+        std::fs::write(&path, &sidecar).unwrap();
+        let p = path.to_str().unwrap();
+        assert!(load_layout(p, &ids, &mut centers), "positions applied");
+        assert_eq!(centers[0], (12.5, 40.0));
+        assert_eq!(centers[1], (300.0, 180.0));
+        // An unknown id is skipped; a matching one still applies.
+        let mut c2 = vec![(1.0, 1.0)];
+        std::fs::write(&path, "Z 9 9\nA 7 8\n").unwrap();
+        assert!(load_layout(p, &["A".into()], &mut c2));
+        assert_eq!(c2[0], (7.0, 8.0));
+        // Missing file → no-op, no error.
+        std::fs::remove_file(&path).ok();
+        assert!(!load_layout(p, &ids, &mut centers));
+        // The write half produces text load_layout reads back verbatim.
+        assert_eq!(layout_path("d.mmd"), "d.mmd.layout");
+    }
 
     /// Just the scene, regardless of whether it stayed a draggable graph.
     fn scene_of(mmd: &str, compact: Option<f64>) -> Scene {
