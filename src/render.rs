@@ -569,7 +569,12 @@ pub fn draw_gitgraph_labels(buf: &mut Buffer, area: Rect, gs: &GitScene, opts: &
     let cx = |x: f64| area.x as i64 + (x / sx).round() as i64;
     let cy = |y: f64| area.y as i64 + (y / sy).round() as i64;
 
-    for l in gs.branch_labels.iter().chain(&gs.tags) {
+    for l in gs
+        .branch_labels
+        .iter()
+        .chain(&gs.commit_ids)
+        .chain(&gs.tags)
+    {
         let x = match l.anchor {
             "middle" => cx(l.x) - (l.text.chars().count() as i64) / 2,
             "end" => cx(l.x) - l.text.chars().count() as i64,
