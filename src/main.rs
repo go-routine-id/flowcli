@@ -194,8 +194,9 @@ fn build(mmd: &str, compact: Option<f64>) -> Result<Built, String> {
         }),
         Document::Er(d) => Ok(Built::Plain(flowmaid::er::scene(&d).scene)),
         Document::Class(d) => Ok(Built::Plain(flowmaid::class::scene(&d).scene)),
+        Document::GitGraph(d) => Ok(Built::Plain(flowmaid::gitgraph::scene(&d).scene)),
         _ => Err("this diagram type isn't drawable in the terminal yet \
-                  (flowchart, state, ER and class are)"
+                  (flowchart, state, ER, class, and gitGraph are)"
             .into()),
     }
 }
