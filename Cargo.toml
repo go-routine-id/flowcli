@@ -14,7 +14,7 @@ path = "src/main.rs"
 [dependencies]
 # The engine: pure-std, zero-dep. We consume only its scene GEOMETRY
 # (no SVG) and re-draw it with box- and line-drawing characters.
-flowmaid = "0.23.0"
+flowmaid = "0.23.1"
 # TUI toolkit. ratatui re-exports crossterm, so the interactive app
 # uses `ratatui::crossterm` and there's no separate version to pin.
 ratatui = "0.29"
