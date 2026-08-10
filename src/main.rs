@@ -250,10 +250,15 @@ fn main() {
             eprintln!("parse error: {e}");
             std::process::exit(1);
         }
-        let out = if let Some(gs) = &app.git_scene {
-            render::preview_with_git(gs, 110, 34, &app.opts())
+        let (cols, rows) = if app.scene.height > app.scene.width * 1.2 {
+            (60, 50)
         } else {
-            render::preview(&app.scene, 110, 34, &app.opts())
+            (110, 34)
+        };
+        let out = if let Some(gs) = &app.git_scene {
+            render::preview_with_git(gs, cols, rows, &app.opts())
+        } else {
+            render::preview(&app.scene, cols, rows, &app.opts())
         };
         print!("{out}");
         return;
