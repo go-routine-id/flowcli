@@ -1,0 +1,15 @@
+gitGraph
+    commit id: "init"
+    branch feat
+    checkout feat
+    commit id: "a"
+    commit id: "b"
+    checkout main
+    commit id: "c"
+    merge feat id: "merge-feat" tag: "v1.0"
+    branch hotfix
+    checkout hotfix
+    commit id: "fix" type: HIGHLIGHT
+    checkout main
+    merge hotfix id: "merge-hotfix"
+    commit id: "release" type: REVERSE tag: "v1.1"

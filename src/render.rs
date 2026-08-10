@@ -7,6 +7,7 @@
 //! real junctions (`├┼┴╮`) for edges, and arrowheads (`▶◀▲▼`) at the
 //! ends. Custom `style` colours (hex) become true-colour cells.
 
+use flowmaid::gitgraph::GitScene;
 use flowmaid::model::Shape;
 use flowmaid::scene::{Scene, SceneNode};
 use ratatui::buffer::Buffer;
@@ -242,10 +243,38 @@ pub fn draw(buf: &mut Buffer, area: Rect, scene: &Scene, opts: &Opts) {
         } else {
             node_color(n)
         };
+        let text_col = if faded {
+            Color::DarkGray
+        } else {
+            label_color(n)
+        };
         let (x0, y0, x1, y1) = box_of[n.id.as_str()];
+
+        // Circle nodes are drawn as a compact marker with the label
+        // underneath — this is the style used by gitGraph commits, where
+        // full ids/tags need to be readable without a big box breaking
+        // the branch lanes.
+        if n.shape == Shape::Circle {
+            let cx = (x0 + x1) / 2;
+            let cy = (y0 + y1) / 2;
+            g.put(cx, cy, '●', col, focus);
+            let label = flowmaid::layout::spans(n.label.split('\n').next().unwrap_or(""))
+                .into_iter()
+                .map(|(t, ..)| t)
+                .collect::<String>();
+            if !label.is_empty() {
+                let start = cx - (label.chars().count() as i64) / 2;
+                let label_y = y1 + 1;
+                for (k, ch) in label.chars().enumerate() {
+                    g.put(start + k as i64, label_y, ch, text_col, focus);
+                }
+            }
+            continue;
+        }
+
         let rounded = matches!(
             n.shape,
-            Shape::Rounded | Shape::Stadium | Shape::Circle | Shape::DoubleCircle
+            Shape::Rounded | Shape::Stadium | Shape::DoubleCircle
         );
         rect(&mut g, x0, y0, x1, y1, col, rounded, focus);
         for r in (y0 + 1)..y1 {
@@ -253,11 +282,6 @@ pub fn draw(buf: &mut Buffer, area: Rect, scene: &Scene, opts: &Opts) {
                 g.put(c, r, ' ', col, false);
             }
         }
-        let text_col = if faded {
-            Color::DarkGray
-        } else {
-            label_color(n)
-        };
         let inner = (x1 - x0 - 1).max(0) as usize;
         let label = flowmaid::layout::spans(n.label.split('\n').next().unwrap_or(""))
             .into_iter()
@@ -329,7 +353,13 @@ pub fn to_scene(scene: &Scene, area: Rect, col: u16, row: u16, opts: &Opts) -> O
 /// Pick whatever the terminal cell sits over, via
 /// [`flowmaid::scene::Scene::hit_test`]. `None` outside the canvas or on
 /// empty space.
-pub fn pick(scene: &Scene, area: Rect, col: u16, row: u16, opts: &Opts) -> Option<flowmaid::scene::Hit> {
+pub fn pick(
+    scene: &Scene,
+    area: Rect,
+    col: u16,
+    row: u16,
+    opts: &Opts,
+) -> Option<flowmaid::scene::Hit> {
     let (x, y) = to_scene(scene, area, col, row, opts)?;
     let (sx, sy) = scale(scene, area.width, area.height, opts);
     // One cell of slack so thin edges are still clickable on a coarse grid.
@@ -526,6 +556,57 @@ fn hex(s: &str) -> Option<Color> {
     Some(Color::Rgb(r, g, b))
 }
 
+/// Overlay git-specific labels (`branch_labels` and `tags`) on top of the
+/// generic scene drawing. Uses the same pixel→cell scale as [`draw`] so the
+/// text lines up with the circles and lanes rendered from `gs.scene`.
+pub fn draw_gitgraph_labels(buf: &mut Buffer, area: Rect, gs: &GitScene, opts: &Opts) {
+    let cols = area.width as usize;
+    let rows = area.height as usize;
+    if cols == 0 || rows == 0 {
+        return;
+    }
+    let (sx, sy) = scale(&gs.scene, area.width, area.height, opts);
+    let cx = |x: f64| area.x as i64 + (x / sx).round() as i64;
+    let cy = |y: f64| area.y as i64 + (y / sy).round() as i64;
+
+    for l in gs
+        .branch_labels
+        .iter()
+        .chain(&gs.commit_ids)
+        .chain(&gs.tags)
+    {
+        let x = match l.anchor {
+            "middle" => cx(l.x) - (l.text.chars().count() as i64) / 2,
+            "end" => cx(l.x) - l.text.chars().count() as i64,
+            _ => cx(l.x), // start
+        };
+        let y = cy(l.y);
+        let col = hex(l.color).unwrap_or(Color::White);
+        let style = Style::default()
+            .fg(col)
+            .add_modifier(if l.font_weight.is_some() {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            });
+        for (k, ch) in l.text.chars().enumerate() {
+            let xc = x + k as i64;
+            let yc = y;
+            if xc < area.x as i64 || yc < area.y as i64 {
+                continue;
+            }
+            let xu = xc as u16;
+            let yu = yc as u16;
+            if xu < area.right() && yu < area.bottom() {
+                let mut b = [0u8; 4];
+                buf[(xu, yu)]
+                    .set_symbol(ch.encode_utf8(&mut b))
+                    .set_style(style);
+            }
+        }
+    }
+}
+
 /// Headless render to a plain-text block — for tests and `--preview`,
 /// so the terminal output is verifiable without an interactive TTY.
 pub fn preview(scene: &Scene, cols: u16, rows: u16, opts: &Opts) -> String {
@@ -535,6 +616,28 @@ pub fn preview(scene: &Scene, cols: u16, rows: u16, opts: &Opts) -> String {
     term.draw(|f| {
         let area = f.area();
         draw(f.buffer_mut(), area, scene, opts);
+    })
+    .unwrap();
+    let buf = term.backend().buffer().clone();
+    let mut out = String::new();
+    for y in 0..rows {
+        for x in 0..cols {
+            out.push_str(buf[(x, y)].symbol());
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Headless render of a git graph, including branch labels and tags.
+pub fn preview_with_git(gs: &GitScene, cols: u16, rows: u16, opts: &Opts) -> String {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    let mut term = Terminal::new(TestBackend::new(cols, rows)).unwrap();
+    term.draw(|f| {
+        let area = f.area();
+        draw(f.buffer_mut(), area, &gs.scene, opts);
+        draw_gitgraph_labels(f.buffer_mut(), area, gs, opts);
     })
     .unwrap();
     let buf = term.backend().buffer().clone();

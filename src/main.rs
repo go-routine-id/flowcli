@@ -14,6 +14,7 @@
 
 mod render;
 
+use flowmaid::gitgraph::GitScene;
 use flowmaid::model::{Document, Graph};
 use flowmaid::scene::Scene;
 use render::Opts;
@@ -25,6 +26,7 @@ use std::time::Duration;
 enum Built {
     Graph { g: Graph, scene: Scene },
     Plain(Scene),
+    GitGraph(GitScene),
 }
 
 /// Drag state for a graph diagram: the moving node plus its base routing,
@@ -52,7 +54,8 @@ struct App {
     pick: Option<String>, // last click readout for an edge/cluster hit
     scene: Scene,
     ids: Vec<String>,
-    graph: Option<GraphState>, // present ⇒ draggable
+    graph: Option<GraphState>,   // present ⇒ draggable
+    git_scene: Option<GitScene>, // present ⇒ gitGraph label overlay
     drag: Option<Drag>,
     err: Option<String>,
 }
@@ -61,10 +64,9 @@ impl App {
     fn rebuild(&mut self) {
         match build(&self.src, self.compact) {
             Ok(built) => {
-                let (scene, graph) = match built {
+                let (scene, graph, git_scene) = match built {
                     Built::Graph { g, scene: fresh } => {
-                        let ids: Vec<String> =
-                            fresh.nodes.iter().map(|n| n.id.clone()).collect();
+                        let ids: Vec<String> = fresh.nodes.iter().map(|n| n.id.clone()).collect();
                         let base_centers: Vec<(f64, f64)> =
                             fresh.nodes.iter().map(|n| (n.x, n.y)).collect();
                         // Apply a saved layout sidecar over the fresh
@@ -82,9 +84,10 @@ impl App {
                             base_centers,
                             centers,
                         };
-                        (scene, Some(gs))
+                        (scene, Some(gs), None)
                     }
-                    Built::Plain(scene) => (scene, None),
+                    Built::Plain(scene) => (scene, None, None),
+                    Built::GitGraph(gs) => (gs.scene.clone(), None, Some(gs)),
                 };
                 self.ids = scene.nodes.iter().map(|n| n.id.clone()).collect();
                 if let Some(f) = self.focus {
@@ -94,6 +97,7 @@ impl App {
                 }
                 self.scene = scene;
                 self.graph = graph;
+                self.git_scene = git_scene;
                 self.drag = None;
                 self.pick = None; // indices change on rebuild
                 self.err = None;
@@ -136,12 +140,8 @@ impl App {
         if let Some(gs) = &mut self.graph {
             if node < gs.centers.len() {
                 gs.centers[node] = (x + off.0, y + off.1);
-                self.scene = flowmaid::scene::route_partial(
-                    &gs.g,
-                    &gs.centers,
-                    &gs.base,
-                    &gs.base_centers,
-                );
+                self.scene =
+                    flowmaid::scene::route_partial(&gs.g, &gs.centers, &gs.base, &gs.base_centers);
             }
         }
     }
@@ -194,8 +194,10 @@ fn build(mmd: &str, compact: Option<f64>) -> Result<Built, String> {
         }),
         Document::Er(d) => Ok(Built::Plain(flowmaid::er::scene(&d).scene)),
         Document::Class(d) => Ok(Built::Plain(flowmaid::class::scene(&d).scene)),
+        Document::GitGraph(d) => Ok(Built::GitGraph(flowmaid::gitgraph::scene(&d))),
+        Document::Architecture(d) => Ok(Built::Plain(flowmaid::architecture::scene(&d).scene)),
         _ => Err("this diagram type isn't drawable in the terminal yet \
-                  (flowchart, state, ER and class are)"
+                  (flowchart, state, ER, class, gitGraph, and architecture are)"
             .into()),
     }
 }
@@ -237,6 +239,7 @@ fn main() {
         scene: Scene::empty(0.0, 0.0),
         ids: Vec::new(),
         graph: None,
+        git_scene: None,
         drag: None,
         err: None,
     };
@@ -248,7 +251,17 @@ fn main() {
             eprintln!("parse error: {e}");
             std::process::exit(1);
         }
-        print!("{}", render::preview(&app.scene, 110, 34, &app.opts()));
+        let (cols, rows) = if app.scene.height > app.scene.width * 1.2 {
+            (60, 50)
+        } else {
+            (110, 34)
+        };
+        let out = if let Some(gs) = &app.git_scene {
+            render::preview_with_git(gs, cols, rows, &app.opts())
+        } else {
+            render::preview(&app.scene, cols, rows, &app.opts())
+        };
+        print!("{out}");
         return;
     }
     if let Err(e) = run(&mut app) {
@@ -258,6 +271,7 @@ fn main() {
 }
 
 fn run(app: &mut App) -> std::io::Result<()> {
+    use flowmaid::scene::Hit;
     use ratatui::crossterm::event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
         MouseEventKind,
@@ -267,7 +281,6 @@ fn run(app: &mut App) -> std::io::Result<()> {
     use ratatui::style::{Color, Modifier, Style};
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Block, Borders, Paragraph};
-    use flowmaid::scene::Hit;
 
     let mut term = ratatui::init();
     let _ = execute!(std::io::stdout(), EnableMouseCapture);
@@ -325,6 +338,9 @@ fn run(app: &mut App) -> std::io::Result<()> {
                 );
             } else {
                 render::draw(f.buffer_mut(), inner, &app.scene, &app.opts());
+                if let Some(gs) = &app.git_scene {
+                    render::draw_gitgraph_labels(f.buffer_mut(), inner, gs, &app.opts());
+                }
             }
 
             let keycap = Style::default().add_modifier(Modifier::REVERSED);
@@ -506,6 +522,7 @@ mod tests {
     fn scene_of(mmd: &str, compact: Option<f64>) -> Scene {
         match build(mmd, compact).unwrap() {
             Built::Graph { scene, .. } | Built::Plain(scene) => scene,
+            Built::GitGraph(gs) => gs.scene,
         }
     }
 
@@ -638,5 +655,28 @@ mod tests {
             build("erDiagram\n a ||--o{ b : has", None).unwrap(),
             Built::Plain(_)
         ));
+    }
+
+    #[test]
+    fn gitgraph_renders_branch_labels_and_tags() {
+        let Built::GitGraph(gs) = build(
+            "gitGraph\n\
+             commit id: \"init\"\n\
+             branch feat\n\
+             checkout feat\n\
+             commit id: \"a\" tag: \"v1.0\"\n\
+             checkout main\n\
+             merge feat id: \"m\"",
+            None,
+        )
+        .unwrap() else {
+            panic!("gitGraph should become a GitGraph built");
+        };
+        let out = render::preview_with_git(&gs, 80, 20, &Opts::default());
+        assert!(out.contains('●'), "commit marker drawn");
+        assert!(out.contains("main"), "branch label drawn");
+        assert!(out.contains("feat"), "branch label drawn");
+        assert!(out.contains("v1.0"), "tag drawn");
+        assert!(out.contains("init"), "commit id drawn");
     }
 }
