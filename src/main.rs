@@ -732,6 +732,43 @@ mod tests {
     }
 
     #[test]
+    fn gitgraph_too_wide_elides_ids_instead_of_overlapping() {
+        // Too wide for the canvas: scale() squeezes it to fit, leaving the
+        // ids no room. Each drawn id is whole or a `…`-cut prefix, never
+        // run into its neighbour; the focused commit's id stays whole.
+        let mut src = String::from("gitGraph\n");
+        let ids: Vec<String> = (1..=25).map(|i| format!("commit-{i}")).collect();
+        for id in &ids {
+            src.push_str(&format!("  commit id: \"{id}\"\n"));
+        }
+        let Built::GitGraph(gs) = build(&src, None).unwrap() else {
+            panic!("gitGraph should become a GitGraph built");
+        };
+        let base = render::git_opts(&gs, &Opts::default());
+        for focus in [None, Some("commit-2")] {
+            let opts = Opts {
+                highlight: focus.map(String::from),
+                ..base.clone()
+            };
+            let out = render::preview_with_git(&gs, 110, 34, &opts);
+            let row = out.lines().find(|l| l.contains("commit-")).expect("id row");
+            for tok in row.split_whitespace() {
+                let ok = match tok.strip_suffix('…') {
+                    Some(cut) => ids.iter().any(|id| id.starts_with(cut) && id != cut),
+                    None => ids.iter().any(|id| id == tok),
+                };
+                assert!(ok, "{tok:?} is neither an id nor a cut one in:\n{out}");
+            }
+            if let Some(f) = focus {
+                assert!(
+                    row.split_whitespace().any(|t| t == f),
+                    "focused id {f:?} whole in:\n{out}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn gitgraph_tb_keeps_ids_on_canvas_and_tags_off_legs() {
         // TB puts end-anchored ids left of the leftmost lane, and nudges a
         // tag off a merge leg by less than one cell's height.
