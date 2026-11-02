@@ -671,9 +671,16 @@ fn hex(s: &str) -> Option<Color> {
     Some(Color::Rgb(r, g, b))
 }
 
-/// Overlay git-specific labels (`branch_labels` and `tags`) on top of the
-/// generic scene drawing. Uses the same pixel→cell scale as [`draw`] so the
-/// text lines up with the circles and lanes rendered from `gs.scene`.
+/// Overlay git-specific labels (`branch_labels`, `commit_ids`, `tags`) on
+/// top of the generic scene drawing. Uses the same pixel→cell scale as
+/// [`draw`] so the text lines up with the glyphs and lanes from `gs.scene`.
+///
+/// When the graph is wider than the canvas, [`scale`] squeezes it to fit
+/// and ids no longer have room. Labels then claim cells in priority order
+/// — branch names, tags, the focused commit's id, then the other ids left
+/// to right — and an id that runs into a claimed cell (or the one-cell gap
+/// after it) is cut to `…` if at least [`MIN_ELIDED_CELLS`] cells are
+/// free, else left out. Focus a commit to read its full id.
 pub fn draw_gitgraph_labels(buf: &mut Buffer, area: Rect, gs: &GitScene, opts: &Opts) {
     let cols = area.width as usize;
     let rows = area.height as usize;
@@ -681,21 +688,56 @@ pub fn draw_gitgraph_labels(buf: &mut Buffer, area: Rect, gs: &GitScene, opts: &
         return;
     }
     let (sx, sy) = scale(&gs.scene, area.width, area.height, opts);
-    let cx = |x: f64| area.x as i64 + (x / sx).round() as i64;
-    let cy = |y: f64| area.y as i64 + (y / sy).round() as i64;
+    let cx = |x: f64| (x / sx).round() as i64;
+    let cy = |y: f64| (y / sy).round() as i64;
 
-    for l in gs
-        .branch_labels
-        .iter()
-        .chain(&gs.commit_ids)
-        .chain(&gs.tags)
-    {
+    let focused = |l: &&flowmaid::gitgraph::GitLabel| opts.highlight.as_deref() == Some(&l.text);
+    let mut ids: Vec<_> = gs.commit_ids.iter().collect();
+    ids.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+    let (focus, rest): (Vec<_>, Vec<_>) = ids.into_iter().partition(focused);
+    let must = gs.branch_labels.iter().chain(&gs.tags).chain(focus);
+
+    // Cells already taken by a drawn label, area-relative.
+    let mut taken = vec![false; cols * rows];
+    // Left of the canvas counts as free (nothing is drawn there); past its
+    // right or bottom edge does not, so an id running off it is cut to `…`.
+    let free = |taken: &[bool], c: i64, r: i64| {
+        c < 0
+            || (r >= 0
+                && c < cols as i64
+                && r < rows as i64
+                && !taken[r as usize * cols + c as usize])
+    };
+    let mut place = |l: &flowmaid::gitgraph::GitLabel, may_elide: bool| {
+        let n = l.text.chars().count() as i64;
         let x = match l.anchor {
-            "middle" => cx(l.x) - (l.text.chars().count() as i64) / 2,
-            "end" => cx(l.x) - l.text.chars().count() as i64,
+            "middle" => cx(l.x) - n / 2,
+            "end" => cx(l.x) - n,
             _ => cx(l.x), // start
         };
         let y = cy(l.y);
+        let text: String = if may_elide {
+            // Free run from `x`, and the cells it may use while keeping a
+            // gap cell before whatever is claimed next.
+            let run = (0..n + ID_GAP_CELLS)
+                .take_while(|&k| free(&taken, x + k, y))
+                .count() as i64;
+            let room = (run - ID_GAP_CELLS).min(n);
+            if !free(&taken, x - ID_GAP_CELLS, y) || room < MIN_ELIDED_CELLS.min(n) {
+                return;
+            }
+            if room == n {
+                l.text.clone()
+            } else {
+                l.text
+                    .chars()
+                    .take(room as usize - 1)
+                    .chain(['…'])
+                    .collect()
+            }
+        } else {
+            l.text.clone()
+        };
         let col = hex(l.color).unwrap_or(Color::White);
         let style = Style::default()
             .fg(col)
@@ -704,23 +746,30 @@ pub fn draw_gitgraph_labels(buf: &mut Buffer, area: Rect, gs: &GitScene, opts: &
             } else {
                 Modifier::empty()
             });
-        for (k, ch) in l.text.chars().enumerate() {
-            let xc = x + k as i64;
-            let yc = y;
-            if xc < area.x as i64 || yc < area.y as i64 {
+        for (k, ch) in text.chars().enumerate() {
+            let (c, r) = (x + k as i64, y);
+            if c < 0 || r < 0 || c >= cols as i64 || r >= rows as i64 {
                 continue;
             }
-            let xu = xc as u16;
-            let yu = yc as u16;
-            if xu < area.right() && yu < area.bottom() {
-                let mut b = [0u8; 4];
-                buf[(xu, yu)]
-                    .set_symbol(ch.encode_utf8(&mut b))
-                    .set_style(style);
-            }
+            taken[r as usize * cols + c as usize] = true;
+            let mut b = [0u8; 4];
+            buf[(area.x + c as u16, area.y + r as u16)]
+                .set_symbol(ch.encode_utf8(&mut b))
+                .set_style(style);
         }
+    };
+    for l in must {
+        place(l, false);
+    }
+    for l in rest {
+        place(l, true);
     }
 }
+
+/// Blank cells kept between an id and the label before or after it.
+const ID_GAP_CELLS: i64 = 1;
+/// Narrowest an id may be cut to: one character plus `…`.
+const MIN_ELIDED_CELLS: i64 = 2;
 
 /// Headless render to a plain-text block — for tests and `--preview`,
 /// so the terminal output is verifiable without an interactive TTY.
