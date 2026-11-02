@@ -18,12 +18,14 @@ use ratatui::style::{Color, Modifier, Style};
 /// terminal cells are roughly twice as tall as wide, so `sy ≈ 2·sx`
 /// keeps the diagram's proportions. `highlight` dims everything except
 /// one node id (drives the interactive "focus a node" mode — this is
-/// what `SceneNode.id` from issue #13 is for).
+/// what `SceneNode.id` from issue #13 is for). `git` draws every node as
+/// a one-cell commit glyph on its lane (see [`git_opts`]).
 #[derive(Clone)]
 pub struct Opts {
     pub sx: f64,
     pub sy: f64,
     pub highlight: Option<String>,
+    pub git: bool,
 }
 
 impl Default for Opts {
@@ -32,7 +34,113 @@ impl Default for Opts {
             sx: 8.5,
             sy: 17.0,
             highlight: None,
+            git: false,
         }
+    }
+}
+
+/// Options for drawing a gitGraph. The engine packs commit columns by its
+/// own (proportional) measure of the id/tag text (flowmaid ≥ 0.33), which
+/// is narrower than one terminal cell per character, so at the default
+/// scale neighbouring ids overwrite each other. Picks the coarsest scale
+/// (never coarser than `base`) at which, in cells:
+/// - neighbouring labels on one row (commit glyphs count as one-character
+///   labels) keep a blank cell between them;
+/// - no end/middle-anchored label runs off the left edge;
+/// - a label never shares a row with another label or a horizontal edge
+///   run it overlaps across, when the engine put them at different `y`
+///   (it nudges tags off legs by less than a cell's height).
+///
+/// `sx` follows the first two, `sy` keeps `base`'s `sy/sx` aspect unless
+/// the third needs it finer. Compute once per scene (it scans every label
+/// pair) and reuse it for draw, overlay and picking.
+pub fn git_opts(gs: &GitScene, base: &Opts) -> Opts {
+    const GAP_CELLS: f64 = 1.0;
+    const SAME_ROW_PX: f64 = 0.5;
+    // Cells `round()` can shift a drawn label by, either way.
+    const ROUND_SLACK: f64 = 0.5;
+    // (x, y, chars, share of the text left of x): start 0, middle ½, end 1.
+    // Text labels first, then one entry per commit glyph.
+    let items: Vec<(f64, f64, f64, f64)> = gs
+        .branch_labels
+        .iter()
+        .chain(&gs.commit_ids)
+        .chain(&gs.tags)
+        .map(|l| {
+            let lead = match l.anchor {
+                "middle" => 0.5,
+                "end" => 1.0,
+                _ => 0.0,
+            };
+            (l.x, l.y, l.text.chars().count() as f64, lead)
+        })
+        .chain(gs.scene.nodes.iter().map(|n| (n.x, n.y, 1.0, 0.5)))
+        .collect();
+    let mut by_row = items.clone();
+    by_row.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.total_cmp(&b.0)));
+    // In cells, L spans [xL/sx - leadL·nL, xL/sx + (1-leadL)·nL); R must
+    // start a gap cell after L ends: (xR - xL)/sx ≥ (1-leadL)·nL + leadR·nR + 1.
+    let between = by_row
+        .windows(2)
+        .filter(|w| (w[1].1 - w[0].1).abs() < SAME_ROW_PX && w[1].0 > w[0].0)
+        .map(|w| {
+            let (l, r) = (w[0], w[1]);
+            (r.0 - l.0) / ((1.0 - l.3) * l.2 + r.3 * r.2 + GAP_CELLS)
+        });
+    // Left edge: x/sx - lead·n ≥ ROUND_SLACK.
+    let left = items
+        .iter()
+        .filter(|i| i.3 > 0.0)
+        .map(|i| i.0 / (i.3 * i.2 + ROUND_SLACK));
+    let sx = between.chain(left).fold(base.sx, f64::min);
+
+    // Horizontal spans in cells at `sx`, with their pixel y. Text labels
+    // are checked against every label, commit glyph and horizontal edge
+    // run. Glyph-vs-edge and edge-vs-edge are left out: legs leave a
+    // commit a few px off its centre, and meet on its row by design.
+    let span =
+        |&(x, y, n, lead): &(f64, f64, f64, f64)| (x / sx - lead * n, x / sx + (1.0 - lead) * n, y);
+    let n_text = items.len() - gs.scene.nodes.len();
+    let texts: Vec<_> = items.iter().take(n_text).map(span).collect();
+    let others: Vec<_> = items
+        .iter()
+        .map(span)
+        .chain(gs.scene.edges.iter().flat_map(|e| {
+            edge_points(e)
+                .windows(2)
+                .filter(|w| (w[1].1 - w[0].1).abs() < SAME_ROW_PX && w[0].0 != w[1].0)
+                .map(|w| (w[0].0.min(w[1].0) / sx, w[0].0.max(w[1].0) / sx, w[0].1))
+                .collect::<Vec<_>>()
+        }))
+        .collect();
+    // Overlapping (± rounding) at a different pixel y ⇒ ≥ 1 row apart:
+    // |Δy|/sy ≥ 1.
+    let sy = texts
+        .iter()
+        .flat_map(|a| others.iter().map(move |b| (a, b)))
+        .filter(|(a, b)| {
+            let dy = (a.2 - b.2).abs();
+            dy >= SAME_ROW_PX && a.0 < b.1 + ROUND_SLACK && b.0 < a.1 + ROUND_SLACK
+        })
+        .map(|(a, b)| (a.2 - b.2).abs())
+        .fold(sx * base.sy / base.sx, f64::min);
+    Opts {
+        sx,
+        sy,
+        git: true,
+        ..base.clone()
+    }
+}
+
+/// The one-cell glyph for a gitGraph commit, by the shape the engine
+/// gives it: a merge is a `DoubleCircle`, a HIGHLIGHT a square `Rect`, a
+/// REVERSE a `Circle` labelled [`flowmaid::gitgraph::REVERSE_MARK`].
+fn commit_glyph(n: &SceneNode) -> char {
+    match n.shape {
+        Shape::DoubleCircle => '◉',
+        Shape::Rect => '■',
+        _ if n.label == flowmaid::gitgraph::REVERSE_MARK => '✕',
+        _ => '●',
     }
 }
 
@@ -250,10 +358,17 @@ pub fn draw(buf: &mut Buffer, area: Rect, scene: &Scene, opts: &Opts) {
         };
         let (x0, y0, x1, y1) = box_of[n.id.as_str()];
 
-        // Circle nodes are drawn as a compact marker with the label
-        // underneath — this is the style used by gitGraph commits, where
-        // full ids/tags need to be readable without a big box breaking
-        // the branch lanes.
+        // gitGraph commits: one glyph on the node's own centre cell, so
+        // it sits on the lane line (the 2-cell minimum box above would
+        // shift a small commit's box centre off the lane). Ids and tags
+        // come from the label overlay, not from here.
+        if opts.git {
+            g.put(cx(n.x), cy(n.y), commit_glyph(n), col, focus);
+            continue;
+        }
+
+        // Circle nodes (outside gitGraph, which returned above) are drawn
+        // as a compact marker with the label underneath.
         if n.shape == Shape::Circle {
             let cx = (x0 + x1) / 2;
             let cy = (y0 + y1) / 2;
@@ -630,6 +745,7 @@ pub fn preview(scene: &Scene, cols: u16, rows: u16, opts: &Opts) -> String {
 }
 
 /// Headless render of a git graph, including branch labels and tags.
+/// `opts` should come from [`git_opts`] (as the app's do).
 pub fn preview_with_git(gs: &GitScene, cols: u16, rows: u16, opts: &Opts) -> String {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
