@@ -56,6 +56,8 @@ struct App {
     ids: Vec<String>,
     graph: Option<GraphState>,   // present ⇒ draggable
     git_scene: Option<GitScene>, // present ⇒ gitGraph label overlay
+    /// [`render::git_opts`] for `git_scene`, computed once per rebuild.
+    git_opts: Option<Opts>,
     drag: Option<Drag>,
     err: Option<String>,
 }
@@ -97,6 +99,9 @@ impl App {
                 }
                 self.scene = scene;
                 self.graph = graph;
+                self.git_opts = git_scene
+                    .as_ref()
+                    .map(|gs| render::git_opts(gs, &Opts::default()));
                 self.git_scene = git_scene;
                 self.drag = None;
                 self.pick = None; // indices change on rebuild
@@ -108,13 +113,9 @@ impl App {
     /// Draw/pick options. A gitGraph gets [`render::git_opts`] so draw,
     /// label overlay and click picking all share one finer scale.
     fn opts(&self) -> Opts {
-        let base = Opts {
+        Opts {
             highlight: self.focus.and_then(|i| self.ids.get(i)).cloned(),
-            ..Opts::default()
-        };
-        match &self.git_scene {
-            Some(gs) => render::git_opts(gs, &base),
-            None => base,
+            ..self.git_opts.clone().unwrap_or_default()
         }
     }
     /// Write the current node positions to `<path>.layout` so a dragged
@@ -246,6 +247,7 @@ fn main() {
         ids: Vec::new(),
         graph: None,
         git_scene: None,
+        git_opts: None,
         drag: None,
         err: None,
     };
@@ -678,7 +680,7 @@ mod tests {
         .unwrap() else {
             panic!("gitGraph should become a GitGraph built");
         };
-        let out = render::preview_with_git(&gs, 80, 20, &Opts::default());
+        let out = render::preview_with_git(&gs, 80, 20, &render::git_opts(&gs, &Opts::default()));
         assert!(out.contains('●'), "commit marker drawn");
         assert!(out.contains("main"), "branch label drawn");
         assert!(out.contains("feat"), "branch label drawn");
@@ -693,7 +695,7 @@ mod tests {
         let Built::GitGraph(gs) = build(include_str!("../examples/git.mmd"), None).unwrap() else {
             panic!("gitGraph should become a GitGraph built");
         };
-        let out = render::preview_with_git(&gs, 110, 34, &Opts::default());
+        let out = render::preview_with_git(&gs, 110, 34, &render::git_opts(&gs, &Opts::default()));
         assert!(out.contains('◉'), "merge commit glyph");
         assert!(out.contains('■'), "HIGHLIGHT commit glyph");
         assert!(out.contains('✕'), "REVERSE commit glyph");
@@ -719,14 +721,33 @@ mod tests {
         let Built::GitGraph(gs) = build(include_str!("../examples/git.mmd"), None).unwrap() else {
             panic!("gitGraph should become a GitGraph built");
         };
-        let out = render::preview_with_git(&gs, 110, 34, &Opts::default());
+        let out = render::preview_with_git(&gs, 110, 34, &render::git_opts(&gs, &Opts::default()));
         for id in ["init", "merge-feat", "merge-hotfix", "release", "fix"] {
             assert!(out.contains(id), "commit id {id:?} intact in:\n{out}");
         }
-        // git_opts is idempotent (App::opts and preview_with_git both apply it).
-        let once = render::git_opts(&gs, &Opts::default());
-        let twice = render::git_opts(&gs, &once);
-        assert_eq!((once.sx, once.sy), (twice.sx, twice.sy));
-        assert!(once.sx < Opts::default().sx, "gitGraph needs a finer scale");
+        assert!(
+            render::git_opts(&gs, &Opts::default()).sx < Opts::default().sx,
+            "gitGraph needs a finer scale"
+        );
+    }
+
+    #[test]
+    fn gitgraph_tb_keeps_ids_on_canvas_and_tags_off_legs() {
+        // TB puts end-anchored ids left of the leftmost lane, and nudges a
+        // tag off a merge leg by less than one cell's height.
+        let src = include_str!("../examples/git.mmd").replacen("gitGraph", "gitGraph TB:", 1);
+        let Built::GitGraph(gs) = build(&src, None).unwrap() else {
+            panic!("gitGraph should become a GitGraph built");
+        };
+        let out = render::preview_with_git(&gs, 60, 50, &render::git_opts(&gs, &Opts::default()));
+        assert!(
+            out.lines().any(|l| l.contains("merge-hotfix")),
+            "leftmost id clipped in:\n{out}"
+        );
+        let tag_row = out.lines().find(|l| l.contains("v1.0")).expect("tag drawn");
+        assert!(
+            !tag_row.contains('─'),
+            "tag drawn over a leg: {tag_row:?}\n{out}"
+        );
     }
 }

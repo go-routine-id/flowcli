@@ -42,15 +42,26 @@ impl Default for Opts {
 /// Options for drawing a gitGraph. The engine packs commit columns by its
 /// own (proportional) measure of the id/tag text (flowmaid ≥ 0.33), which
 /// is narrower than one terminal cell per character, so at the default
-/// scale neighbouring ids overwrite each other. Picks the coarsest `sx`
-/// (never coarser than `base.sx`) at which every pair of neighbouring
-/// labels on a row — commit glyphs count as one-character labels — keeps
-/// one blank cell between them, keeps the `sy/sx` aspect, and switches on
-/// commit glyphs. Depends only on `gs` and `base`'s ratio, so re-applying
-/// it is a no-op.
+/// scale neighbouring ids overwrite each other. Picks the coarsest scale
+/// (never coarser than `base`) at which, in cells:
+/// - neighbouring labels on one row (commit glyphs count as one-character
+///   labels) keep a blank cell between them;
+/// - no end/middle-anchored label runs off the left edge;
+/// - a label never shares a row with another label or a horizontal edge
+///   run it overlaps across, when the engine put them at different `y`
+///   (it nudges tags off legs by less than a cell's height).
+///
+/// `sx` follows the first two, `sy` keeps `base`'s `sy/sx` aspect unless
+/// the third needs it finer. Compute once per scene (it scans every label
+/// pair) and reuse it for draw, overlay and picking.
 pub fn git_opts(gs: &GitScene, base: &Opts) -> Opts {
+    const GAP_CELLS: f64 = 1.0;
+    const SAME_ROW_PX: f64 = 0.5;
+    // Cells `round()` can shift a drawn label by, either way.
+    const ROUND_SLACK: f64 = 0.5;
     // (x, y, chars, share of the text left of x): start 0, middle ½, end 1.
-    let mut items: Vec<(f64, f64, f64, f64)> = gs
+    // Text labels first, then one entry per commit glyph.
+    let items: Vec<(f64, f64, f64, f64)> = gs
         .branch_labels
         .iter()
         .chain(&gs.commit_ids)
@@ -65,22 +76,57 @@ pub fn git_opts(gs: &GitScene, base: &Opts) -> Opts {
         })
         .chain(gs.scene.nodes.iter().map(|n| (n.x, n.y, 1.0, 0.5)))
         .collect();
-    items.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.total_cmp(&b.0)));
+    let mut by_row = items.clone();
+    by_row.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.total_cmp(&b.0)));
     // In cells, L spans [xL/sx - leadL·nL, xL/sx + (1-leadL)·nL); R must
     // start a gap cell after L ends: (xR - xL)/sx ≥ (1-leadL)·nL + leadR·nR + 1.
-    const GAP_CELLS: f64 = 1.0;
-    const SAME_ROW_PX: f64 = 0.5;
-    let sx = items
+    let between = by_row
         .windows(2)
         .filter(|w| (w[1].1 - w[0].1).abs() < SAME_ROW_PX && w[1].0 > w[0].0)
         .map(|w| {
             let (l, r) = (w[0], w[1]);
             (r.0 - l.0) / ((1.0 - l.3) * l.2 + r.3 * r.2 + GAP_CELLS)
+        });
+    // Left edge: x/sx - lead·n ≥ ROUND_SLACK.
+    let left = items
+        .iter()
+        .filter(|i| i.3 > 0.0)
+        .map(|i| i.0 / (i.3 * i.2 + ROUND_SLACK));
+    let sx = between.chain(left).fold(base.sx, f64::min);
+
+    // Horizontal spans in cells at `sx`, with their pixel y. Text labels
+    // are checked against every label, commit glyph and horizontal edge
+    // run. Glyph-vs-edge and edge-vs-edge are left out: legs leave a
+    // commit a few px off its centre, and meet on its row by design.
+    let span =
+        |&(x, y, n, lead): &(f64, f64, f64, f64)| (x / sx - lead * n, x / sx + (1.0 - lead) * n, y);
+    let n_text = items.len() - gs.scene.nodes.len();
+    let texts: Vec<_> = items.iter().take(n_text).map(span).collect();
+    let others: Vec<_> = items
+        .iter()
+        .map(span)
+        .chain(gs.scene.edges.iter().flat_map(|e| {
+            edge_points(e)
+                .windows(2)
+                .filter(|w| (w[1].1 - w[0].1).abs() < SAME_ROW_PX && w[0].0 != w[1].0)
+                .map(|w| (w[0].0.min(w[1].0) / sx, w[0].0.max(w[1].0) / sx, w[0].1))
+                .collect::<Vec<_>>()
+        }))
+        .collect();
+    // Overlapping (± rounding) at a different pixel y ⇒ ≥ 1 row apart:
+    // |Δy|/sy ≥ 1.
+    let sy = texts
+        .iter()
+        .flat_map(|a| others.iter().map(move |b| (a, b)))
+        .filter(|(a, b)| {
+            let dy = (a.2 - b.2).abs();
+            dy >= SAME_ROW_PX && a.0 < b.1 + ROUND_SLACK && b.0 < a.1 + ROUND_SLACK
         })
-        .fold(base.sx, f64::min);
+        .map(|(a, b)| (a.2 - b.2).abs())
+        .fold(sx * base.sy / base.sx, f64::min);
     Opts {
         sx,
-        sy: sx * base.sy / base.sx,
+        sy,
         git: true,
         ..base.clone()
     }
@@ -699,10 +745,10 @@ pub fn preview(scene: &Scene, cols: u16, rows: u16, opts: &Opts) -> String {
 }
 
 /// Headless render of a git graph, including branch labels and tags.
+/// `opts` should come from [`git_opts`] (as the app's do).
 pub fn preview_with_git(gs: &GitScene, cols: u16, rows: u16, opts: &Opts) -> String {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
-    let opts = &git_opts(gs, opts);
     let mut term = Terminal::new(TestBackend::new(cols, rows)).unwrap();
     term.draw(|f| {
         let area = f.area();
