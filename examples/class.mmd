@@ -1,0 +1,17 @@
+classDiagram
+    class Order {
+        +uuid id
+        +Money total
+        +place()
+        +cancel()
+    }
+    class LineItem {
+        +int qty
+        +Money price
+    }
+    class Customer {
+        +string name
+        +string email
+    }
+    Customer "1" --> "*" Order : places
+    Order "1" *-- "*" LineItem : contains

@@ -65,7 +65,7 @@ The only dependencies are `flowmaid` and `ratatui` — nothing else.
 
 Clicking runs the diagram's geometry through `Scene::hit_test` ([flowmaid #17](https://github.com/go-routine-id/flowmaid/issues/17)): the terminal cell is mapped back to a scene pixel and the engine reports the node, edge, or cluster under it — a node pick lights up focus, an edge or cluster shows in the title bar. Zoom/pan never enter the engine; the same picking API a web canvas would call drives a *pure-terminal* renderer, which is the whole point — if the geometry were wrong, the click would miss.
 
-**Dragging** grabs the picked node and moves it: each mouse-move feeds the new centre to `route_partial`, which re-routes *only* the edges touching that node and preserves the rest — the same live-drag path [flowmaid-desktop](https://github.com/go-routine-id/flowmaid-desktop) uses, now in a terminal. That closes the editor loop the engine was built for: **pick → drag → route**, all on the renderer-agnostic scene. (Nodes snap to the character grid, so movement is chunky by a cell — which is itself proof the routing holds up at low resolution.) Drag works on flowchart and state diagrams, the ones that carry a source graph; ER, class, and the folded `--compact` view stay static.
+**Dragging** grabs the picked node and moves it: each mouse-move feeds the new centre to `route_partial`, which re-routes *only* the edges touching that node and preserves the rest — the same live-drag path [flowmaid-desktop](https://github.com/go-routine-id/flowmaid-desktop) uses, now in a terminal. That closes the editor loop the engine was built for: **pick → drag → route**, all on the renderer-agnostic scene. (Nodes snap to the character grid, so movement is chunky by a cell — which is itself proof the routing holds up at low resolution.) Drag works on flowchart and state diagrams, the ones that carry a source graph; ER, class, gitGraph, architecture, and the folded `--compact` view stay static.
 
 **Saving** (`s`) writes the current node positions to a `<file>.layout` sidecar — one `<id> <x> <y>` line per node — which is read back the next time you open the file, so a hand-tuned arrangement persists. Why a sidecar and not the `.mmd` itself? Mermaid has *no syntax for absolute node positions*, so a layout can't round-trip through the source; the `.mmd` stays canonical mermaid and the positions live alongside it. (For persisting the diagram's *structure* after a structural edit, that's what the engine's `to_mermaid` is for — flowcli only edits layout, so it uses the sidecar.)
 
@@ -115,8 +115,15 @@ The whole thing is verifiable **without a TTY**: `render::preview` (and the `--p
 | `examples/pipeline.mmd`| flowchart (long chain, good for `--compact`) |
 | `examples/state.mmd`   | state machine |
 | `examples/er.mmd`      | ER diagram |
+| `examples/class.mmd`   | class diagram (boxes and edges only — members, arrowheads and relation labels aren't drawn yet) |
+| `examples/architecture.mmd` | architecture-beta (services inside a group) |
+| `examples/git.mmd`     | gitGraph (branches, merges, tags) |
+| `examples/git-tb.mmd`  | gitGraph `TB:` — vertical lanes, every commit glyph |
+| `examples/git-wide.mmd`| gitGraph with 25 commits — ids that don't fit are elided with `…` or hidden instead of overlapping |
 
-flowcli draws flowchart, state, ER and class diagrams — every flowmaid type whose scene carries node/edge geometry.
+flowcli draws flowchart, state, ER, class, gitGraph and architecture diagrams — every flowmaid type whose scene carries node/edge geometry.
+
+In a gitGraph each commit is a glyph on its lane: `●` normal, `■` `HIGHLIGHT`, `✕` `REVERSE`, `◉` merge. Branch names and tags are always drawn; commit ids are placed left to right and elided (`…`) or skipped when they would run into a neighbour — focus a commit with `Tab` to see its full id.
 
 ## The flowmaid family
 

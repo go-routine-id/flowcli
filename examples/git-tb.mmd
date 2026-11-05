@@ -1,0 +1,13 @@
+gitGraph TB:
+    commit id: "init"
+    branch develop
+    checkout develop
+    commit id: "api"
+    branch feature
+    checkout feature
+    commit id: "ui" type: HIGHLIGHT
+    checkout develop
+    merge feature id: "merge-ui"
+    checkout main
+    merge develop id: "release" tag: "v1.0"
+    commit id: "revert-x" type: REVERSE
