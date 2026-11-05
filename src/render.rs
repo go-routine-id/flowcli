@@ -281,10 +281,40 @@ pub fn draw(buf: &mut Buffer, area: Rect, scene: &Scene, opts: &Opts) {
         if matches!(e.kind, flowmaid::model::EdgeKind::Invisible) {
             continue;
         }
-        let pts: Vec<(i64, i64)> = edge_points(e)
-            .into_iter()
-            .map(|(x, y)| (cx(x), cy(y)))
-            .collect();
+        let raw = edge_points(e);
+        let mut pts: Vec<(i64, i64)> = raw.iter().map(|&(x, y)| (cx(x), cy(y))).collect();
+        // Off every box's interior, so an arrowhead never lands on a
+        // label (a border cell is fine — heads sit on the frame).
+        let clear_of_interiors = |c: (i64, i64)| {
+            box_of
+                .values()
+                .all(|&(x0, y0, x1, y1)| c.0 <= x0 || c.0 >= x1 || c.1 <= y0 || c.1 >= y1)
+        };
+        // An arrowed edge that ends on a face of its target box gets its
+        // head on that face's border cell, pointing square in (issue #6:
+        // aiming at the box centre turned heads sideways on wide, short
+        // boxes); the line is cut back to meet it.
+        let entry = if e.kind.has_arrow() {
+            by_id
+                .get(e.to.as_str())
+                .zip(box_of.get(e.to.as_str()))
+                .zip(raw.last())
+                .and_then(|((t, &bx), &end)| face_entry(t, bx, end, sx, sy))
+                .filter(|&(cell, _)| clear_of_interiors(cell))
+        } else {
+            None
+        };
+        if let Some((anchor, _)) = entry {
+            let (x0, y0, x1, y1) = box_of[e.to.as_str()];
+            while pts.len() > 1
+                && pts
+                    .last()
+                    .is_some_and(|&(c, r)| c >= x0 && c <= x1 && r >= y0 && r <= y1)
+            {
+                pts.pop();
+            }
+            pts.push(anchor);
+        }
         let faded = dim && !edge_touches(e, opts.highlight.as_deref());
         let col = if faded {
             Color::DarkGray
@@ -297,9 +327,17 @@ pub fn draw(buf: &mut Buffer, area: Rect, scene: &Scene, opts: &Opts) {
         for w in pts.windows(2) {
             colour_run(&mut g, w[0], w[1], col, !faded);
         }
-        // Arrowhead: the last polyline cell OUTSIDE the target node box,
-        // pointing toward it. Placed after nodes are drawn.
-        if e.kind.has_arrow() {
+        if let Some((cell, dir)) = entry {
+            arrows.push(Arrow {
+                cell,
+                dir,
+                col,
+                bold: !faded,
+            });
+        } else if e.kind.has_arrow() {
+            // Fallback (no box face, e.g. a cluster target or an end off
+            // the frame): the last polyline cell OUTSIDE the target node
+            // box, pointing toward it. Placed after nodes are drawn.
             let tbox = box_of.get(e.to.as_str()).copied();
             // Outside the INTERIOR of every node box, so an arrow never
             // lands on another node's label.
@@ -572,6 +610,49 @@ fn opposite(b: u8) -> u8 {
         _ => 0,
     }
 }
+
+/// How far (in cells) an edge's end may sit off a box face and still
+/// count as entering through it.
+const FACE_SLACK_CELLS: f64 = 0.5;
+
+/// The face of `t` that the edge end `end` (scene px) lies on, as the
+/// arrowhead cell on that face's border (in `bx`, the node's cell box)
+/// and the direction pointing square into it. `None` when the end
+/// is on no face — e.g. a diamond's slanted outline.
+fn face_entry(
+    t: &SceneNode,
+    bx: (i64, i64, i64, i64),
+    end: (f64, f64),
+    sx: f64,
+    sy: f64,
+) -> Option<((i64, i64), u8)> {
+    let (x0, y0, x1, y1) = bx;
+    let (left, right) = (t.x - t.w / 2.0, t.x + t.w / 2.0);
+    let (top, bottom) = (t.y - t.h / 2.0, t.y + t.h / 2.0);
+    let along_x = end.0 >= left - sx / 2.0 && end.0 <= right + sx / 2.0;
+    let along_y = end.1 >= top - sy / 2.0 && end.1 <= bottom + sy / 2.0;
+    let faces = [
+        ((end.1 - top).abs() / sy, along_x, DN),
+        ((end.1 - bottom).abs() / sy, along_x, UP),
+        ((end.0 - left).abs() / sx, along_y, RT),
+        ((end.0 - right).abs() / sx, along_y, LT),
+    ];
+    let (_, _, dir) = faces
+        .into_iter()
+        .filter(|&(off, along, _)| along && off <= FACE_SLACK_CELLS)
+        .min_by(|a, b| a.0.total_cmp(&b.0))?;
+    // Keep the head off the box's corners (boxes are ≥ 2 cells wide/tall).
+    let col = ((end.0 / sx).round() as i64).clamp(x0 + 1, x1 - 1);
+    let row = ((end.1 / sy).round() as i64).clamp(y0 + 1, y1 - 1);
+    let cell = match dir {
+        DN => (col, y0),
+        UP => (col, y1),
+        RT => (x0, row),
+        _ => (x1, row),
+    };
+    Some((cell, dir))
+}
+
 fn step_dir(a: (i64, i64), b: (i64, i64)) -> u8 {
     let (dc, dr) = (b.0 - a.0, b.1 - a.1);
     if dc.abs() >= dr.abs() {
