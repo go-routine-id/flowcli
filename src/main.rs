@@ -790,4 +790,48 @@ mod tests {
             "tag drawn over a leg: {tag_row:?}\n{out}"
         );
     }
+
+    /// A `◀`/`▶` sitting inside a horizontal box border (`┌▶──`, `╭──◀─╮`):
+    /// an edge entering a top/bottom face drawn pointing sideways.
+    fn sideways_heads_on_borders(out: &str) -> Vec<String> {
+        const BORDER: &str = "─┌┐└┘╭╮╰╯";
+        out.lines()
+            .filter(|l| {
+                let cs: Vec<char> = l.chars().collect();
+                cs.windows(3)
+                    .any(|w| "◀▶".contains(w[1]) && BORDER.contains(w[0]) && BORDER.contains(w[2]))
+            })
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn arrowheads_enter_top_and_bottom_faces_square() {
+        // State boxes are wide and short, so an edge entering one off-centre
+        // used to point at the box centre — sideways — instead of into the
+        // face it touches (issue #6). Retry enters Idle from below.
+        for src in [
+            include_str!("../examples/state.mmd"),
+            include_str!("../examples.mmd"),
+        ] {
+            let Built::Graph { scene, .. } = build(src, None).unwrap() else {
+                panic!("should stay a draggable graph");
+            };
+            for (cols, rows) in [(110, 34), (60, 50)] {
+                let out = render::preview(&scene, cols, rows, &Opts::default());
+                let bad = sideways_heads_on_borders(&out);
+                assert!(bad.is_empty(), "sideways heads on {bad:?}\n{out}");
+            }
+        }
+        let Built::Graph { scene, .. } =
+            build(include_str!("../examples/state.mmd"), None).unwrap()
+        else {
+            unreachable!()
+        };
+        let out = render::preview(&scene, 60, 50, &Opts::default());
+        assert!(
+            out.lines().any(|l| l.contains('▲') && l.contains('╰')),
+            "retry should enter Idle's bottom face as ▲:\n{out}"
+        );
+    }
 }
