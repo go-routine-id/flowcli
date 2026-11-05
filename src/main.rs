@@ -24,7 +24,7 @@ use std::time::Duration;
 /// keep their source graph so nodes can be dragged and re-routed live via
 /// `route_partial`; everything else is a static `Plain` scene.
 enum Built {
-    Graph { g: Graph, scene: Scene },
+    Graph { g: Box<Graph>, scene: Scene },
     Plain(Scene),
     GitGraph(GitScene),
 }
@@ -81,7 +81,7 @@ impl App {
                             fresh.clone()
                         };
                         let gs = GraphState {
-                            g,
+                            g: *g,
                             base: fresh,
                             base_centers,
                             centers,
@@ -196,7 +196,10 @@ fn build(mmd: &str, compact: Option<f64>) -> Result<Built, String> {
             ),
             None => {
                 let scene = flowmaid::scene::scene(&g);
-                Built::Graph { g, scene }
+                Built::Graph {
+                    g: Box::new(g),
+                    scene,
+                }
             }
         }),
         Document::Er(d) => Ok(Built::Plain(flowmaid::er::scene(&d).scene)),
