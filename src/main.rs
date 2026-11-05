@@ -3,6 +3,7 @@
 //!   flowcli diagram.mmd              # interactive
 //!   flowcli diagram.mmd --preview    # print once (headless) and exit
 //!   flowcli diagram.mmd --compact 200
+//!   flowcli --version | --self-update
 //!
 //! Interactive keys: q quit · Tab/BackTab focus a node · s save the
 //! dragged layout to a `<file>.layout` sidecar (auto-loaded next open)
@@ -13,6 +14,7 @@
 //! and state diagrams).
 
 mod render;
+mod update;
 
 use flowmaid::gitgraph::GitScene;
 use flowmaid::model::{Document, Graph};
@@ -212,6 +214,9 @@ fn build(mmd: &str, compact: Option<f64>) -> Result<Built, String> {
     }
 }
 
+const USAGE: &str =
+    "usage: flowcli <file.mmd> [--preview] [--compact <px>]\n       flowcli --version | --self-update";
+
 fn main() {
     let mut path = None;
     let mut preview = false;
@@ -222,14 +227,19 @@ fn main() {
             "--preview" => preview = true,
             "--compact" => compact = args.next().and_then(|v| v.parse().ok()),
             "-h" | "--help" => {
-                eprintln!("usage: flowcli <file.mmd> [--preview] [--compact <px>]");
+                eprintln!("{USAGE}");
                 return;
             }
+            "-V" | "--version" => {
+                println!("flowcli {}", env!("CARGO_PKG_VERSION"));
+                return;
+            }
+            "--self-update" => std::process::exit(update::self_update()),
             other => path = Some(other.to_string()),
         }
     }
     let Some(path) = path else {
-        eprintln!("usage: flowcli <file.mmd> [--preview] [--compact <px>]");
+        eprintln!("{USAGE}");
         std::process::exit(2);
     };
     let src = match std::fs::read_to_string(&path) {

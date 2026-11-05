@@ -38,17 +38,71 @@ flowcli is a [ratatui](https://ratatui.rs) front-end for the flowmaid diagram en
 
 *(Above: `flowcli examples.mmd --preview`. In a real terminal the boxes are true-colour — diamonds render yellow, cylinders blue, start/stop nodes green — and arrowheads point along the flow.)*
 
-## Install & run
+## Install
+
+Prebuilt binaries for macOS, Linux and Windows are attached to every release —
+**[Download latest release](https://github.com/go-routine-id/flowcli/releases/latest)**.
+
+### macOS & Linux — one line
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/go-routine-id/flowcli/main/install.sh | bash
+```
+
+The script detects your platform (macOS arm64 / x86_64, Linux x86_64),
+downloads the matching binary, verifies its SHA-256 checksum, and installs it
+to `/usr/local/bin` (asking for `sudo` only if that folder isn't writable).
+
+| Variable              | Effect                                          |
+| --------------------- | ----------------------------------------------- |
+| `FLOWCLI_VERSION`     | Pin a release tag, e.g. `v0.1.0` (default: latest) |
+| `FLOWCLI_INSTALL_DIR` | Install somewhere else, e.g. `~/.local/bin`     |
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/go-routine-id/flowcli/main/install.sh | FLOWCLI_INSTALL_DIR=~/.local/bin bash
+```
+
+### Windows (x64)
+
+Download `flowcli-windows-x86_64.exe` from the
+[latest release](https://github.com/go-routine-id/flowcli/releases/latest),
+rename it to `flowcli.exe`, and put it in a folder on your `PATH`.
+
+### Upgrade
+
+```sh
+flowcli --self-update   # macOS & Linux: re-runs the installer into the same folder
+```
+
+On Windows, download the new `.exe` and replace the old one.
+
+### macOS: "cannot be opened because the developer cannot be verified"
+
+The binaries aren't notarized. The installer clears the quarantine flag for
+you; if you downloaded the binary by hand through a browser, clear it yourself:
+
+```sh
+xattr -d com.apple.quarantine /usr/local/bin/flowcli
+```
+
+### Build from source
 
 ```sh
 git clone https://github.com/go-routine-id/flowcli
 cd flowcli
-cargo run --release -- examples.mmd            # interactive TUI
-cargo run --release -- examples.mmd --preview  # print once (headless) and exit
-cargo run --release -- examples/pipeline.mmd --compact 200
+cargo run --release -- examples.mmd
 ```
 
 The only dependencies are `flowmaid` and `ratatui` — nothing else.
+
+## Run
+
+```sh
+flowcli examples.mmd                     # interactive TUI
+flowcli examples.mmd --preview           # print once (headless) and exit
+flowcli examples/pipeline.mmd --compact 200
+flowcli --version
+```
 
 ## Keybindings
 
