@@ -1,6 +1,6 @@
 [package]
 name = "flowcli"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
 description = "Render flowmaid diagrams in the terminal with ratatui — the renderer-agnostic scene API driving box- and line-drawing output."
