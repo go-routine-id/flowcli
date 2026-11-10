@@ -117,8 +117,34 @@ The only dependencies are `flowmaid` and `ratatui` — nothing else.
 flowcli examples.mmd                     # interactive TUI
 flowcli examples.mmd --preview           # print once (headless) and exit
 flowcli examples/pipeline.mmd --compact 200
+flowcli diagram.mmd --watch              # redraw whenever the file changes
+flowcli diagram.mmd --events picks.jsonl # log what you select as JSON Lines
 flowcli --version
 ```
+
+### Watching a file and following selections
+
+`--watch` re-reads the file whenever its content changes on disk, which is what you want when an editor or an AI agent keeps rewriting it. The file is checked every 150 ms, and a change is drawn once it reads the same twice in a row, so a save written in several chunks is never parsed half-way. Nodes you dragged stay where you put them; nodes you didn't drag follow the new layout, and the focused node stays focused even if its position in the file changed. A reload never cuts a drag short: it waits until you release the node. If the new source doesn't parse, the last good diagram stays on screen and the error shows in red in the title bar until the file parses again.
+
+Dragged nodes keep their *absolute* position, the same way the `.layout` sidecar does. If an edit shifts the rest of the layout a lot (for example, a new node inserted above), a dragged node can end up overlapping one that moved into its place. Drag it again, or press `r` to reload without your unsaved drags.
+
+`--events <path>` appends one JSON object per line to `path` for everything you point at, so another program can follow along without scraping the screen. The file is only ever appended to, so `tail -n 1` gives the latest event. Every line has `event`, `file` (the diagram's absolute path) and `ts` (Unix epoch milliseconds):
+
+| `event`    | Extra fields                                                                 |
+| ---------- | ---------------------------------------------------------------------------- |
+| `open`     | —                                                                            |
+| `select`   | `kind`: `node` (`id`, `label`, `via` = `click`, `key`, or `reload` when a reload changed the selected node's label), `edge` (`from`, `to`, `label`), or `cluster` (`id`, `title`) |
+| `clear`    | — nothing is selected any more: a click on empty space, or a reload removed what was selected |
+| `drag_end` | `id`, `x`, `y` (the node's new centre, in scene px)                          |
+| `reload`   | `ok`, plus `error` when the new source didn't parse                          |
+| `quit`     | —                                                                            |
+
+```jsonl
+{"event":"select","file":"/work/arch.mmd","ts":1794308756256,"kind":"node","id":"A","label":"Alpha","via":"click"}
+{"event":"drag_end","file":"/work/arch.mmd","ts":1794308757160,"id":"A","x":62.3,"y":132}
+```
+
+The last `select` (or a later `clear`) is always the current selection, reloads included. Both flags need the interactive view, so they can't be combined with `--preview`, and `--events` refuses to write into the diagram file itself.
 
 ## Keybindings
 
@@ -131,7 +157,7 @@ flowcli --version
 | `BackTab` / `←` `↑` | Focus the previous node                                        |
 | `s`            | Save the dragged layout to a `<file>.layout` sidecar                |
 | `c`            | Toggle the serpentine **compact** layout                            |
-| `r`            | Reload the `.mmd` file from disk                                     |
+| `r`            | Reload the `.mmd` file from disk, dropping unsaved drags (`--watch` reloads by itself and keeps them) |
 
 Clicking runs the diagram's geometry through `Scene::hit_test` ([flowmaid #17](https://github.com/go-routine-id/flowmaid/issues/17)): the terminal cell is mapped back to a scene pixel and the engine reports the node, edge, or cluster under it — a node pick lights up focus, an edge or cluster shows in the title bar. Zoom/pan never enter the engine; the same picking API a web canvas would call drives a *pure-terminal* renderer, which is the whole point — if the geometry were wrong, the click would miss.
 
