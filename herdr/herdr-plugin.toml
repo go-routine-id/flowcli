@@ -1,0 +1,38 @@
+# herdr-plugin.toml — flowcli as a Herdr plugin.
+#
+# Opens a diagram in a pane next to your agent with `--watch --events`:
+# the agent writes the .mmd, the pane redraws it on every save, and what
+# you click is appended to `<file>.events.jsonl` for the agent to read.
+#
+# Install (the whole repo is checked out; this folder is the plugin root):
+#   herdr plugin install go-routine-id/flowcli/herdr
+id = "flowcli"
+name = "flowcli"
+version = "0.1.0"
+description = "Draw mermaid-like diagrams in a pane next to your agent; it redraws on every save and logs what you click for the agent to read."
+min_herdr_version = "0.9.0"
+platforms = ["macos", "linux"]
+
+# Download the prebuilt flowcli release matching this checkout's
+# Cargo.toml version into ./bin (checksum-verified by install.sh), so the
+# binary always matches the plugin and no Rust toolchain is needed.
+[[build]]
+command = ["bash", "scripts/install-flowcli.sh"]
+
+# The diagram view. Opened with FLOWCLI_FILE=<absolute .mmd path>, e.g.
+#   herdr plugin pane open --plugin flowcli --entrypoint view \
+#     --placement split --direction right --no-focus \
+#     --env FLOWCLI_FILE=/abs/diagram.mmd
+[[panes]]
+id = "view"
+title = "flowcli"
+placement = "split"
+command = ["sh", "scripts/view.sh"]
+
+# For people: open the most recently changed .mmd in the focused pane's
+# directory. Bind it to a key via [[keys.command]] in Herdr's config.toml.
+[[actions]]
+id = "open-diagram"
+title = "flowcli: open the latest diagram here"
+description = "Open the newest .mmd in the focused pane's directory in a flowcli pane on the right."
+command = ["bash", "scripts/open-latest.sh"]

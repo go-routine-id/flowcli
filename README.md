@@ -137,7 +137,7 @@ Dragged nodes keep their *absolute* position, the same way the `.layout` sidecar
 | `clear`    | — nothing is selected any more: a click on empty space, or a reload removed what was selected |
 | `drag_end` | `id`, `x`, `y` (the node's new centre, in scene px)                          |
 | `reload`   | `ok`, plus `error` when the new source didn't parse                          |
-| `quit`     | —                                                                            |
+| `quit`     | — (written when you quit; a process killed from outside, e.g. by closing its pane, can't write it) |
 
 ```jsonl
 {"event":"select","file":"/work/arch.mmd","ts":1794308756256,"kind":"node","id":"A","label":"Alpha","via":"click"}
@@ -145,6 +145,43 @@ Dragged nodes keep their *absolute* position, the same way the `.layout` sidecar
 ```
 
 The last `select` (or a later `clear`) is always the current selection, reloads included. Both flags need the interactive view, so they can't be combined with `--preview`, and `--events` refuses to write into the diagram file itself.
+
+### Herdr plugin: diagrams next to your AI agent
+
+[Herdr](https://github.com/herdrdev/herdr) runs coding agents in terminal panes. The plugin in [`herdr/`](herdr/) puts the two flags above together: the agent writes a `.mmd`, a flowcli pane next to it redraws it on every save, and what you click is logged next to the diagram so the agent can read it when you say "explain this one".
+
+```
++-------------------+  writes flow.mmd   +--------------------------+
+| agent pane        |------------------->| flowcli pane             |
+| (Claude, Codex,…) |                    | --watch --events         |
++-------------------+                    +------------+-------------+
+          ^                                           | you click a node
+          |  reads the last select/clear line         v
+          +----------------------------- flow.mmd.events.jsonl
+```
+
+A click is only logged. The agent reads the log when you refer to the diagram, so clicking around never starts work on its own.
+
+```sh
+herdr plugin install go-routine-id/flowcli/herdr
+```
+
+The install downloads the prebuilt release matching the checked-out `Cargo.toml` version into the plugin's own `bin/` and verifies its checksum, so it needs no Rust toolchain and no `sudo` (macOS and Linux). Herdr keeps one plugin registry per session, so run the install in each named session where you want it.
+
+- **Open a diagram** (what the agent runs; the path must be absolute):
+  ```sh
+  herdr plugin pane open --plugin flowcli --entrypoint view \
+    --placement split --direction right --no-focus --env FLOWCLI_FILE=/abs/path/flow.mmd
+  ```
+  `--no-focus` leaves focus with the agent's pane. The selection log defaults to `<file>.events.jsonl`; set `FLOWCLI_EVENTS` to put it elsewhere.
+- **Open the newest `.mmd` in the focused pane's folder**: the `open-diagram` action, for example `herdr plugin action invoke open-diagram --plugin flowcli`, or bound to a key in Herdr's config.
+- **Teach your agent**: [`herdr/skill/SKILL.md`](herdr/skill/SKILL.md) tells an agent how to draw, open the pane, check that a save parsed, and read the selection. Plugin installs don't copy skills. For Claude Code, copy it yourself:
+  ```sh
+  mkdir -p ~/.claude/skills/flowcli
+  cp "$(herdr plugin list --plugin flowcli --json | sed -n 's/.*"plugin_root":"\([^"]*\)".*/\1/p')/skill/SKILL.md" ~/.claude/skills/flowcli/
+  ```
+
+The `.events.jsonl` and `.layout` files sit next to your diagrams; add both patterns to your project's `.gitignore`.
 
 ## Keybindings
 
