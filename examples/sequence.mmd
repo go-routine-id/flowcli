@@ -1,0 +1,22 @@
+sequenceDiagram
+    autonumber
+    actor U as User
+    participant W as Web
+    participant A as API
+    participant D as DB
+    U->>+W: open dashboard
+    W->>+A: GET /me
+    A-->>-W: 401 expired
+    Note right of W: refresh the token
+    alt token refreshed
+        W->>A: POST /refresh
+        A-->>W: new token
+    else refresh failed
+        W-xU: back to login
+    end
+    loop every 30s
+        W-)A: heartbeat
+    end
+    A->>A: audit log
+    A->D: write audit row
+    W-->>-U: dashboard

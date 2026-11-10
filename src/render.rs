@@ -8,8 +8,9 @@
 //! ends. Custom `style` colours (hex) become true-colour cells.
 
 use flowmaid::gitgraph::GitScene;
-use flowmaid::model::Shape;
+use flowmaid::model::{FrameKind, SeqHead, Shape};
 use flowmaid::scene::{Scene, SceneNode};
+use flowmaid::seq::{PartBox, SeqScene};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -454,6 +455,11 @@ pub fn draw(buf: &mut Buffer, area: Rect, scene: &Scene, opts: &Opts) {
     }
 
     // 6) Blit the grid into the ratatui buffer.
+    blit(&g, buf, area);
+}
+
+/// Copy the painted cells of `g` into `area` of `buf`.
+fn blit(g: &Grid, buf: &mut Buffer, area: Rect) {
     for r in 0..g.rows {
         for c in 0..g.cols {
             if let Some(cell) = g.cells[r * g.cols + c] {
@@ -855,12 +861,18 @@ const MIN_ELIDED_CELLS: i64 = 2;
 /// Headless render to a plain-text block — for tests and `--preview`,
 /// so the terminal output is verifiable without an interactive TTY.
 pub fn preview(scene: &Scene, cols: u16, rows: u16, opts: &Opts) -> String {
+    render_text(cols, rows, |buf, area| draw(buf, area, scene, opts))
+}
+
+/// Run `paint` on a headless `cols`×`rows` terminal and return its
+/// cells as plain text, one line per row.
+fn render_text(cols: u16, rows: u16, paint: impl FnOnce(&mut Buffer, Rect)) -> String {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     let mut term = Terminal::new(TestBackend::new(cols, rows)).unwrap();
     term.draw(|f| {
         let area = f.area();
-        draw(f.buffer_mut(), area, scene, opts);
+        paint(f.buffer_mut(), area);
     })
     .unwrap();
     let buf = term.backend().buffer().clone();
@@ -877,22 +889,316 @@ pub fn preview(scene: &Scene, cols: u16, rows: u16, opts: &Opts) -> String {
 /// Headless render of a git graph, including branch labels and tags.
 /// `opts` should come from [`git_opts`] (as the app's do).
 pub fn preview_with_git(gs: &GitScene, cols: u16, rows: u16, opts: &Opts) -> String {
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
-    let mut term = Terminal::new(TestBackend::new(cols, rows)).unwrap();
-    term.draw(|f| {
-        let area = f.area();
-        draw(f.buffer_mut(), area, &gs.scene, opts);
-        draw_gitgraph_labels(f.buffer_mut(), area, gs, opts);
+    render_text(cols, rows, |buf, area| {
+        draw(buf, area, &gs.scene, opts);
+        draw_gitgraph_labels(buf, area, gs, opts);
     })
-    .unwrap();
-    let buf = term.backend().buffer().clone();
-    let mut out = String::new();
-    for y in 0..rows {
-        for x in 0..cols {
-            out.push_str(buf[(x, y)].symbol());
-        }
-        out.push('\n');
+}
+
+// ---------------------------------------------------------------------
+// Sequence diagrams
+// ---------------------------------------------------------------------
+
+/// Colours of the sequence painter, kept together so the palette reads
+/// as one theme: guides (lifelines, frames) recede, messages and labels
+/// stand out, actors are told apart from plain participants.
+const SEQ_GUIDE: Color = Color::DarkGray;
+const SEQ_PART: Color = Color::Cyan;
+const SEQ_ACTOR: Color = Color::Magenta;
+const SEQ_LINE: Color = Color::Gray;
+const SEQ_TEXT: Color = Color::White;
+const SEQ_NUMBER: Color = Color::Yellow;
+const SEQ_NOTE: Color = Color::Yellow;
+const SEQ_ACTIVATION: Color = Color::Cyan;
+const SEQ_FRAME_LABEL: Color = Color::Gray;
+
+/// Pixels-per-cell used to fit a sequence diagram into `cols`×`rows`:
+/// the same rule as [`scale`], over [`SeqScene`]'s own extent.
+pub fn seq_scale(sc: &SeqScene, cols: u16, rows: u16, opts: &Opts) -> (f64, f64) {
+    let sx = (sc.width / cols.max(1) as f64).max(opts.sx);
+    let sy = (sc.height / rows.max(1) as f64).max(opts.sy);
+    (sx, sy)
+}
+
+/// Plain text of a (possibly multi-line, possibly `<b>`-tagged) label,
+/// on one line — terminal cells hold one row of text per element.
+fn flat_label(s: &str) -> String {
+    s.split('\n')
+        .map(|l| {
+            flowmaid::layout::spans(l)
+                .into_iter()
+                .map(|(t, ..)| t)
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Write `text` starting at cell `(c, r)`, clipped to the grid.
+fn put_text(g: &mut Grid, c: i64, r: i64, text: &str, fg: Color, bold: bool) {
+    for (k, ch) in text.chars().enumerate() {
+        g.put(c + k as i64, r, ch, fg, bold);
     }
-    out
+}
+
+/// Cell box `(x0, y0, x1, y1)` for a scene rectangle, grown (about its
+/// centre) to hold `text_cells` of text on its middle row and at least
+/// one inner row — the engine sizes boxes by proportional text width,
+/// which is narrower than one cell per character.
+fn text_box(
+    (x, y, w, h): (f64, f64, f64, f64),
+    text_cells: i64,
+    cx: impl Fn(f64) -> i64,
+    cy: impl Fn(f64) -> i64,
+) -> (i64, i64, i64, i64) {
+    let (mut x0, mut x1) = (cx(x), cx(x + w));
+    let need = text_cells + 3; // two borders + a blank cell each side, minus one
+    if x1 - x0 < need {
+        let grow = need - (x1 - x0);
+        x0 -= grow / 2;
+        x1 += grow - grow / 2;
+    }
+    let y0 = cy(y);
+    let y1 = cy(y + h).max(y0 + 2);
+    (x0, y0, x1, y1)
+}
+
+/// Head glyph for a message pointing right (`right`) or left.
+fn seq_head_glyph(head: SeqHead, right: bool) -> Option<char> {
+    match head {
+        SeqHead::Filled => Some(if right { '▶' } else { '◀' }),
+        SeqHead::Open | SeqHead::Async => Some(if right { '▷' } else { '◁' }),
+        SeqHead::Cross => Some('✕'),
+        SeqHead::None => None,
+    }
+}
+
+/// Draw a sequence diagram into `area` of `buf`. Static: there is
+/// nothing to pick or drag, so this is the whole adapter.
+pub fn draw_seq(buf: &mut Buffer, area: Rect, sc: &SeqScene, opts: &Opts) {
+    let cols = area.width as usize;
+    let rows = area.height as usize;
+    if cols == 0 || rows == 0 {
+        return;
+    }
+    let mut g = Grid::new(cols, rows);
+    let (sx, sy) = seq_scale(sc, area.width, area.height, opts);
+    let cx = |x: f64| (x / sx).round() as i64;
+    let cy = |y: f64| (y / sy).round() as i64;
+
+    // Participant cell boxes, header and footer, computed up front:
+    // lifelines run between them.
+    // An actor's slot is taller to fit its stick figure, which a cell
+    // grid can't draw: give it a plain box's height (same top edge) so
+    // it doesn't swallow the first message row.
+    let part_box = |b: &PartBox| {
+        let label = flat_label(&b.label);
+        let h = b.h.min(flowmaid::seq::BOX_H);
+        let bx = text_box((b.x, b.y, b.w, h), label.chars().count() as i64, cx, cy);
+        (bx, label)
+    };
+    let heads: Vec<_> = sc.boxes.iter().map(part_box).collect();
+    let feet: Vec<_> = sc.footer.iter().map(part_box).collect();
+    let life_col = |i: usize| sc.lifelines.get(i).map(|l| cx(l.x));
+
+    // 1) Lifelines (dashed, behind everything).
+    for (i, l) in sc.lifelines.iter().enumerate() {
+        let c = cx(l.x);
+        let top = heads.get(i).map(|(b, _)| b.3 + 1).unwrap_or(cy(l.y0));
+        let bottom = feet.get(i).map(|(b, _)| b.1 - 1).unwrap_or(cy(l.y1));
+        for r in top..=bottom {
+            g.put(c, r, '┆', SEQ_GUIDE, false);
+        }
+    }
+
+    // 2) Frames: dim border, `[kind] label` chip on the top edge,
+    // `┄` dividers with their own `[else]` / `[and]` chip.
+    for f in &sc.frames {
+        let (x0, y0) = (cx(f.x), cy(f.y));
+        let (x1, y1) = (cx(f.x + f.w), cy(f.y + f.h).max(cy(f.y) + 1));
+        rect(&mut g, x0, y0, x1, y1, SEQ_GUIDE, false, false);
+        let inner = (x1 - x0 - 1).max(0) as usize;
+        let chip = |kw: &str, label: &str| {
+            let label = flat_label(label);
+            let s = if label.is_empty() {
+                format!("[{kw}]")
+            } else {
+                format!("[{kw}] {label}")
+            };
+            s.chars().take(inner).collect::<String>()
+        };
+        put_text(
+            &mut g,
+            x0 + 1,
+            y0,
+            &chip(f.kind.keyword(), &f.label),
+            SEQ_FRAME_LABEL,
+            true,
+        );
+        let divider_kw = match f.kind {
+            FrameKind::Par => "and",
+            _ => "else",
+        };
+        for (dy, label) in &f.dividers {
+            let r = cy(*dy);
+            g.put(x0, r, '├', SEQ_GUIDE, false);
+            for c in (x0 + 1)..x1 {
+                g.put(c, r, '┄', SEQ_GUIDE, false);
+            }
+            g.put(x1, r, '┤', SEQ_GUIDE, false);
+            put_text(
+                &mut g,
+                x0 + 1,
+                r,
+                &chip(divider_kw, label),
+                SEQ_FRAME_LABEL,
+                true,
+            );
+        }
+    }
+
+    // 3) Activation bars over the lifelines.
+    for a in &sc.activations {
+        let c = cx(a.x);
+        for r in cy(a.y0)..=cy(a.y1) {
+            g.put(c, r, '┃', SEQ_ACTIVATION, false);
+        }
+    }
+
+    // 4) Messages: line, head, label (with the autonumber prefix).
+    for m in &sc.messages {
+        let (Some(&first), Some(&last)) = (m.points.first(), m.points.last()) else {
+            continue;
+        };
+        let (h, v) = if m.dashed {
+            ('╌', '╎')
+        } else {
+            ('─', '│')
+        };
+        let label = {
+            let text = flat_label(&m.text);
+            match m.number {
+                Some(n) if text.is_empty() => format!("{n}."),
+                Some(n) => format!("{n}. {text}"),
+                None => text,
+            }
+        };
+        let numbered = m
+            .number
+            .map(|n| format!("{n}.").chars().count())
+            .unwrap_or(0);
+        let put_label = |g: &mut Grid, start: i64, r: i64| {
+            for (k, ch) in label.chars().enumerate() {
+                let (fg, bold) = if k < numbered {
+                    (SEQ_NUMBER, true)
+                } else {
+                    (SEQ_TEXT, false)
+                };
+                g.put(start + k as i64, r, ch, fg, bold);
+            }
+        };
+        if m.points.len() >= 4 {
+            // Self-message: out right, down, back into the lifeline.
+            let s = life_col(m.from).unwrap_or(cx(first.0));
+            let c1 = cx(m.points[1].0).max(s + 2);
+            let r0 = cy(first.1);
+            let r1 = cy(last.1).max(r0 + 1);
+            for c in (s + 1)..c1 {
+                g.put(c, r0, h, SEQ_LINE, false);
+                g.put(c, r1, h, SEQ_LINE, false);
+            }
+            g.put(c1, r0, '╮', SEQ_LINE, false);
+            for r in (r0 + 1)..r1 {
+                g.put(c1, r, v, SEQ_LINE, false);
+            }
+            g.put(c1, r1, '╯', SEQ_LINE, false);
+            if let Some(hc) = seq_head_glyph(m.head, false) {
+                g.put(s + 1, r1, hc, SEQ_TEXT, true);
+            }
+            put_label(&mut g, c1 + 2, r0);
+            continue;
+        }
+        let s = life_col(m.from).unwrap_or(cx(first.0));
+        let t = life_col(m.to).unwrap_or(cx(last.0));
+        let right = t >= s;
+        let dir = if right { 1 } else { -1 };
+        let r = cy(first.1);
+        // The line runs between the two lifelines, which stay visible.
+        let (a, b) = (s + dir, t - dir);
+        let (lo, hi) = (a.min(b), a.max(b));
+        for c in lo..=hi {
+            g.put(c, r, h, SEQ_LINE, false);
+        }
+        if let Some(hc) = seq_head_glyph(m.head, right) {
+            g.put(b, r, hc, SEQ_TEXT, true);
+        }
+        // Label on the row above the line, centred on the engine's anchor.
+        let lr = cy(m.label_pos.1).min(r - 1);
+        let w = label.chars().count() as i64;
+        let start = if m.label_centered {
+            cx(m.label_pos.0) - w / 2
+        } else {
+            cx(m.label_pos.0)
+        };
+        put_label(&mut g, start, lr);
+    }
+
+    // 5) Notes: yellow cards — or, when the note is under two rows
+    // tall at this scale, a one-row `▌ text ▐` band so the card's
+    // borders don't spill onto the rows around it.
+    for n in &sc.notes {
+        let text = flat_label(&n.text);
+        let w = text.chars().count() as i64;
+        if cy(n.y + n.h) - cy(n.y) < 2 {
+            let start = cx(n.x + n.w / 2.0) - (w + 4) / 2;
+            let r = cy(n.y + n.h / 2.0);
+            put_text(&mut g, start, r, &format!("▌ {text} ▐"), SEQ_NOTE, false);
+            continue;
+        }
+        let (x0, y0, x1, y1) = text_box((n.x, n.y, n.w, n.h), w, cx, cy);
+        rect(&mut g, x0, y0, x1, y1, SEQ_NOTE, false, false);
+        for r in (y0 + 1)..y1 {
+            for c in (x0 + 1)..x1 {
+                g.put(c, r, ' ', SEQ_NOTE, false);
+            }
+        }
+        let inner = (x1 - x0 - 1).max(0);
+        let start = x0 + 1 + (inner - text.chars().count() as i64).max(0) / 2;
+        put_text(&mut g, start, (y0 + y1) / 2, &text, SEQ_NOTE, false);
+    }
+
+    // 6) Participant boxes on top, header and footer; the lifeline
+    // joins each one with a `┬` / `┴` on its border.
+    let parts = sc.boxes.iter().zip(&heads).map(|(p, b)| (p, b, true));
+    let footers = sc.footer.iter().zip(&feet).map(|(p, b)| (p, b, false));
+    for (i, (p, ((x0, y0, x1, y1), label), header)) in parts.enumerate().chain(footers.enumerate())
+    {
+        let (x0, y0, x1, y1) = (*x0, *y0, *x1, *y1);
+        let col = if p.actor { SEQ_ACTOR } else { SEQ_PART };
+        rect(&mut g, x0, y0, x1, y1, col, p.actor, true);
+        for r in (y0 + 1)..y1 {
+            for c in (x0 + 1)..x1 {
+                g.put(c, r, ' ', col, false);
+            }
+        }
+        let inner = (x1 - x0 - 1).max(0);
+        let start = x0 + 1 + (inner - label.chars().count() as i64).max(0) / 2;
+        put_text(&mut g, start, (y0 + y1) / 2, label, SEQ_TEXT, true);
+        if let Some(c) = life_col(i) {
+            if c > x0 && c < x1 {
+                if header {
+                    g.put(c, y1, '┬', col, true);
+                } else {
+                    g.put(c, y0, '┴', col, true);
+                }
+            }
+        }
+    }
+
+    blit(&g, buf, area);
+}
+
+/// Headless render of a sequence diagram — `--preview` and tests.
+pub fn preview_seq(sc: &SeqScene, cols: u16, rows: u16, opts: &Opts) -> String {
+    render_text(cols, rows, |buf, area| draw_seq(buf, area, sc, opts))
 }
