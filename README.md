@@ -184,7 +184,7 @@ The whole thing is verifiable **without a TTY**: `render::preview` (and the `--p
 | `examples.mmd`         | flowchart  |
 | `examples/pipeline.mmd`| flowchart (long chain, good for `--compact`) |
 | `examples/state.mmd`   | state machine |
-| `examples/er.mmd`      | ER diagram |
+| `examples/er.mmd`      | ER diagram — typed columns with keys and comments, an alias title, identifying and non-identifying relations, every cardinality |
 | `examples/class.mmd`   | class diagram — members, `«interface»`, every relation type, cardinalities, labels, a note |
 | `examples/architecture.mmd` | architecture-beta (services inside a group) |
 | `examples/git.mmd`     | gitGraph (branches, merges, tags) |
@@ -268,6 +268,43 @@ A class diagram is drawn from flowmaid's `ClassScene`: each class box is split i
                                      └───────────────────┘        └─────────────────┘
 ```
 *(`flowcli examples/class.mmd --preview`)*
+
+An ER diagram is drawn from flowmaid's `ErScene`: each table shows its title (the alias when one is given, e.g. `categories["Category"]`), a divider, then one column per row with type, name, keys (`PK`, `FK`, `UK`, or a list like `PK,FK`) and comment lined up in columns. Cardinalities are written as text just outside the table at their end — `1` for `||`, `0..1` for `|o`, `0..*` for `}o`, `1..*` for `}|` — and the relation label sits beside its line. An identifying relation (`--`) is a solid line, a non-identifying one (`..`) dashed `╌`/`╎`; neither has an arrowhead. Tables can be focused and picked like flowchart nodes but not dragged. A table drawn smaller than it needs keeps its title and folds the columns that do not fit into a `…` row.
+
+```
+                     ┌────────────────────────────────────────────────┐
+                     │                     users                      │
+                     ├────────────────────────────────────────────────┤
+                     │ uuid       id          PK                      │
+                     │ varchar    email       UK  login, lower-cased  │
+                     │ timestamp  created_at                          │
+                     └──────────────────┬──────────┬──────────────────┘
+                                       ╭╯ 1        ╰╮ 0..1
+                                      ╭╯            ╎
+                                    ╭─╯ writes      ╰╌╮
+                                   ╭╯             has ╰╮
+                                   │ 0..*              ╎
+                 ┌─────────────────┴──────┐            ╰╮ 0..1
+                 │         posts          │      ┌──────┴─────────────────┐
+                 ├────────────────────────┤      │        profiles        │
+                 │ uuid  id           PK  │      ├────────────────────────┤
+                 │ uuid  author_id    FK  │      │ uuid  user_id  PK,FK   │
+                 │ uuid  category_id  FK  │      │ text  bio              │
+                 │ text  body             │      └────────────────────────┘
+                 │                        │
+                 └──────┬─────────┬───────┘
+                       ╭╯ 0..*     ╎ 1..*
+                     ╭─╯           ╰╌╮ tagged
+                    ╭╯ in            ╰╮
+                    │ 1               ╰╮ 1..*
+    ┌───────────────┴────┐       ┌─────┴───────────────┐
+    │      Category      │       │        tags         │
+    ├────────────────────┤       ├─────────────────────┤
+    │ int      id    PK  │       │ int      id    PK   │
+    │ varchar  slug  UK  │       │ varchar  name       │
+    └────────────────────┘       └─────────────────────┘
+```
+*(`flowcli examples/er.mmd --preview`)*
 
 In a gitGraph each commit is a glyph on its lane: `●` normal, `■` `HIGHLIGHT`, `✕` `REVERSE`, `◉` merge. Branch names and tags are always drawn; commit ids are placed left to right and elided (`…`) or skipped when they would run into a neighbour — focus a commit with `Tab` to see its full id.
 

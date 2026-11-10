@@ -1,13 +1,28 @@
 erDiagram
     users ||--o{ posts : writes
     posts }o--|| categories : in
+    users |o..o| profiles : has
+    posts }|..|{ tags : tagged
     users {
         uuid id PK
-        varchar email UK
+        varchar email UK "login, lower-cased"
         timestamp created_at
     }
     posts {
         uuid id PK
         uuid author_id FK
+        uuid category_id FK
         text body
+    }
+    categories["Category"] {
+        int id PK
+        varchar slug UK
+    }
+    profiles {
+        uuid user_id PK, FK
+        text bio
+    }
+    tags {
+        int id PK
+        varchar name
     }

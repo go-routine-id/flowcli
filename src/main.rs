@@ -17,6 +17,7 @@ mod render;
 mod update;
 
 use flowmaid::class::ClassScene;
+use flowmaid::er::ErScene;
 use flowmaid::gitgraph::GitScene;
 use flowmaid::model::{Document, Graph};
 use flowmaid::scene::Scene;
@@ -39,6 +40,9 @@ enum Built {
     /// A class diagram: its scene plus the members, end glyphs,
     /// cardinalities and notes the class overlay draws on top.
     Class(ClassScene),
+    /// An ER diagram: its scene plus the tables' columns and the
+    /// relationships' cardinalities the ER overlay draws on top.
+    Er(ErScene),
 }
 
 /// Drag state for a graph diagram: the moving node plus its base routing,
@@ -68,11 +72,13 @@ struct App {
     ids: Vec<String>,
     graph: Option<GraphState>,   // present ⇒ draggable
     git_scene: Option<GitScene>, // present ⇒ gitGraph label overlay
-    /// The finer scale a gitGraph ([`render::git_opts`]) or class diagram
-    /// ([`render::class_opts`]) is drawn at, computed once per rebuild.
+    /// The finer scale a gitGraph ([`render::git_opts`]), class diagram
+    /// ([`render::class_opts`]) or ER diagram ([`render::er_opts`]) is
+    /// drawn at, computed once per rebuild.
     fit_opts: Option<Opts>,
     seq_scene: Option<SeqScene>, // present ⇒ drawn by the sequence painter
     class_scene: Option<ClassScene>, // present ⇒ class overlay
+    er_scene: Option<ErScene>,   // present ⇒ ER overlay
     drag: Option<Drag>,
     err: Option<String>,
 }
@@ -81,7 +87,7 @@ impl App {
     fn rebuild(&mut self) {
         match build(&self.src, self.compact) {
             Ok(built) => {
-                let (scene, graph, git_scene, seq_scene, class_scene) = match built {
+                let (scene, graph, git_scene, seq_scene, class_scene, er_scene) = match built {
                     Built::Graph { g, scene: fresh } => {
                         let ids: Vec<String> = fresh.nodes.iter().map(|n| n.id.clone()).collect();
                         let base_centers: Vec<(f64, f64)> =
@@ -101,12 +107,14 @@ impl App {
                             base_centers,
                             centers,
                         };
-                        (scene, Some(gs), None, None, None)
+                        (scene, Some(gs), None, None, None, None)
                     }
-                    Built::Plain(scene) => (scene, None, None, None, None),
-                    Built::GitGraph(gs) => (gs.scene.clone(), None, Some(gs), None, None),
-                    // The real scene, so classes can be focused and picked.
-                    Built::Class(cs) => (cs.scene.clone(), None, None, None, Some(cs)),
+                    Built::Plain(scene) => (scene, None, None, None, None, None),
+                    Built::GitGraph(gs) => (gs.scene.clone(), None, Some(gs), None, None, None),
+                    // The real scene, so classes and tables can be focused
+                    // and picked.
+                    Built::Class(cs) => (cs.scene.clone(), None, None, None, Some(cs), None),
+                    Built::Er(es) => (es.scene.clone(), None, None, None, None, Some(es)),
                     // An empty scene of the same extent: picking and focus
                     // find nothing, the preview size rule still applies.
                     Built::Sequence(sq) => (
@@ -114,6 +122,7 @@ impl App {
                         None,
                         None,
                         Some(sq),
+                        None,
                         None,
                     ),
                 };
@@ -132,10 +141,16 @@ impl App {
                         class_scene
                             .as_ref()
                             .map(|cs| render::class_opts(cs, &Opts::default()))
+                    })
+                    .or_else(|| {
+                        er_scene
+                            .as_ref()
+                            .map(|es| render::er_opts(es, &Opts::default()))
                     });
                 self.git_scene = git_scene;
                 self.seq_scene = seq_scene;
                 self.class_scene = class_scene;
+                self.er_scene = er_scene;
                 self.drag = None;
                 self.pick = None; // indices change on rebuild
                 self.err = None;
@@ -143,9 +158,10 @@ impl App {
             Err(e) => self.err = Some(e),
         }
     }
-    /// Draw/pick options. A gitGraph gets [`render::git_opts`] and a class
-    /// diagram [`render::class_opts`], so draw, overlay and click picking
-    /// all share one finer scale.
+    /// Draw/pick options. A gitGraph gets [`render::git_opts`], a class
+    /// diagram [`render::class_opts`] and an ER diagram
+    /// [`render::er_opts`], so draw, overlay and click picking all share
+    /// one finer scale.
     fn opts(&self) -> Opts {
         Opts {
             highlight: self.focus.and_then(|i| self.ids.get(i)).cloned(),
@@ -236,7 +252,7 @@ fn build(mmd: &str, compact: Option<f64>) -> Result<Built, String> {
                 }
             }
         }),
-        Document::Er(d) => Ok(Built::Plain(flowmaid::er::scene(&d).scene)),
+        Document::Er(d) => Ok(Built::Er(flowmaid::er::scene(&d))),
         Document::Class(d) => Ok(Built::Class(flowmaid::class::scene(&d))),
         Document::GitGraph(d) => Ok(Built::GitGraph(flowmaid::gitgraph::scene(&d))),
         Document::Architecture(d) => Ok(Built::Plain(flowmaid::architecture::scene(&d).scene)),
@@ -296,6 +312,7 @@ fn main() {
         fit_opts: None,
         seq_scene: None,
         class_scene: None,
+        er_scene: None,
         drag: None,
         err: None,
     };
@@ -316,6 +333,8 @@ fn main() {
             render::preview_seq(sq, cols, rows, &app.opts())
         } else if let Some(cs) = &app.class_scene {
             render::preview_class(cs, cols, rows, &app.opts())
+        } else if let Some(es) = &app.er_scene {
+            render::preview_er(es, cols, rows, &app.opts())
         } else if let Some(gs) = &app.git_scene {
             render::preview_with_git(gs, cols, rows, &app.opts())
         } else {
@@ -410,6 +429,8 @@ fn run(app: &mut App) -> std::io::Result<()> {
                 render::draw_seq(f.buffer_mut(), inner, sq, &app.opts());
             } else if let Some(cs) = &app.class_scene {
                 render::draw_class(f.buffer_mut(), inner, cs, &app.opts());
+            } else if let Some(es) = &app.er_scene {
+                render::draw_er(f.buffer_mut(), inner, es, &app.opts());
             } else {
                 render::draw(f.buffer_mut(), inner, &app.scene, &app.opts());
                 if let Some(gs) = &app.git_scene {
@@ -435,9 +456,9 @@ fn run(app: &mut App) -> std::io::Result<()> {
                     Span::styled(" click ", keycap),
                     Span::raw(" pick  "),
                 ];
-                // Class boxes are static: no drag, no layout to save, and
-                // `build` ignores compact for them.
-                if app.class_scene.is_none() {
+                // Class boxes and ER tables are static: no drag, no layout
+                // to save, and `build` ignores compact for them.
+                if app.class_scene.is_none() && app.er_scene.is_none() {
                     keys.extend([
                         Span::styled(" drag ", keycap),
                         Span::raw(" move node  "),
@@ -615,6 +636,7 @@ mod tests {
             Built::GitGraph(gs) => gs.scene,
             Built::Sequence(sq) => Scene::empty(sq.width, sq.height),
             Built::Class(cs) => cs.scene,
+            Built::Er(es) => es.scene,
         }
     }
 
@@ -745,7 +767,7 @@ mod tests {
         // ER rides different geometry with no source graph → no drag.
         assert!(matches!(
             build("erDiagram\n a ||--o{ b : has", None).unwrap(),
-            Built::Plain(_)
+            Built::Er(_)
         ));
     }
 
@@ -1152,5 +1174,115 @@ mod tests {
             out.contains("Customer") && out.contains("+string name"),
             "{out}"
         );
+    }
+
+    fn er_of(mmd: &str) -> ErScene {
+        match build(mmd, None).unwrap() {
+            Built::Er(es) => es,
+            _ => panic!("not built as an ER diagram"),
+        }
+    }
+
+    /// The ER preview at the app's own scale.
+    fn er_preview(es: &ErScene, cols: u16, rows: u16) -> String {
+        render::preview_er(es, cols, rows, &render::er_opts(es, &Opts::default()))
+    }
+
+    #[test]
+    fn er_example_draws_columns_keys_cards_and_labels() {
+        let es = er_of(include_str!("../examples/er.mmd"));
+        let out = er_preview(&es, 110, 34);
+        for text in [
+            "users",
+            "posts",
+            "profiles",
+            "tags",
+            "Category", // the alias, not the id
+            "author_id",
+            "created_at",
+            "PK,FK",
+            "login, lower-cased",
+            "writes",
+            "in",
+            "has",
+            "tagged",
+            "0..*",
+            "0..1",
+            "1..*",
+        ] {
+            assert!(out.contains(text), "{text}:\n{out}");
+        }
+        assert!(!out.contains("categories"), "alias replaces the id:\n{out}");
+        // Type, name and key columns line up across a table's rows.
+        let col = |needle: &str| {
+            let l = out.lines().find(|l| l.contains(needle)).unwrap();
+            l.find(needle).unwrap() - l.find("uuid").unwrap()
+        };
+        assert_eq!(col("author_id"), col("category_id"), "{out}");
+    }
+
+    #[test]
+    fn er_cards_read_as_text_per_kind() {
+        for (rel, card) in [
+            ("||--||", "1"),
+            ("|o--o|", "0..1"),
+            ("}o--o{", "0..*"),
+            ("}|--|{", "1..*"),
+        ] {
+            let es = er_of(&format!("erDiagram\n  a {rel} b : r"));
+            let out = er_preview(&es, 60, 30);
+            assert_eq!(out.matches(card).count(), 2, "{rel}:\n{out}");
+            // Where a line meets a table, the border opens into it.
+            assert!(out.contains('┬') && out.contains('┴'), "{rel}:\n{out}");
+        }
+    }
+
+    #[test]
+    fn er_dashes_non_identifying_relations_without_arrowheads() {
+        let out = er_preview(&er_of("erDiagram\n  a ||..o{ b : may"), 60, 30);
+        assert!(out.contains('╎') || out.contains('╌'), "{out}");
+        assert!(!out.contains(['▲', '▼', '▶', '◀']), "{out}");
+        let out = er_preview(&er_of("erDiagram\n  a ||--o{ b : must"), 60, 30);
+        assert!(!out.contains(['╎', '╌', '▲', '▼', '▶', '◀']), "{out}");
+    }
+
+    #[test]
+    fn er_scale_is_never_coarser_than_default() {
+        let es = er_of(include_str!("../examples/er.mmd"));
+        let o = render::er_opts(&es, &Opts::default());
+        assert!(o.sx <= Opts::default().sx && o.sy <= Opts::default().sy);
+        assert!(o.sx > 0.0 && o.sy > 0.0);
+    }
+
+    #[test]
+    fn er_squeezed_table_keeps_its_title() {
+        let es = er_of(include_str!("../examples/er.mmd"));
+        let out = er_preview(&es, 110, 16);
+        for name in ["users", "posts", "Category", "profiles", "tags"] {
+            assert!(out.contains(name), "{name}:\n{out}");
+        }
+        assert!(out.contains('…'), "cut rows are marked:\n{out}");
+    }
+
+    #[test]
+    fn er_survives_tiny_areas() {
+        let es = er_of(include_str!("../examples/er.mmd"));
+        for (c, r) in [(1, 1), (2, 1), (5, 3), (12, 6), (30, 10)] {
+            assert_eq!(er_preview(&es, c, r).lines().count(), r as usize);
+        }
+        // A table without columns is just its title.
+        let out = er_preview(&er_of("erDiagram\n  a ||--o{ b : r"), 60, 30);
+        assert!(!out.contains('├'), "{out}");
+    }
+
+    #[test]
+    fn er_tables_can_be_focused() {
+        let es = er_of(include_str!("../examples/er.mmd"));
+        let opts = Opts {
+            highlight: Some(es.scene.nodes[0].id.clone()),
+            ..render::er_opts(&es, &Opts::default())
+        };
+        let out = render::preview_er(&es, 110, 34, &opts);
+        assert!(out.contains("users") && out.contains("created_at"), "{out}");
     }
 }
