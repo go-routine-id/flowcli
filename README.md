@@ -185,7 +185,7 @@ The whole thing is verifiable **without a TTY**: `render::preview` (and the `--p
 | `examples/pipeline.mmd`| flowchart (long chain, good for `--compact`) |
 | `examples/state.mmd`   | state machine |
 | `examples/er.mmd`      | ER diagram |
-| `examples/class.mmd`   | class diagram (boxes and edges only — members, arrowheads and relation labels aren't drawn yet) |
+| `examples/class.mmd`   | class diagram — members, `«interface»`, every relation type, cardinalities, labels, a note |
 | `examples/architecture.mmd` | architecture-beta (services inside a group) |
 | `examples/git.mmd`     | gitGraph (branches, merges, tags) |
 | `examples/git-tb.mmd`  | gitGraph `TB:` — vertical lanes, every commit glyph |
@@ -231,6 +231,43 @@ A sequence diagram is drawn from flowmaid's own `SeqScene` (participants, lifeli
     ╰────────╯      └─────────┘       └────────┘     └────────┘
 ```
 *(`flowcli examples/sequence.mmd --preview`)*
+
+A class diagram is drawn from flowmaid's `ClassScene`: each class box is split into compartments — stereotype and name, then attributes, then operations — with one member per row (static members underlined, abstract ones in italics). The end glyph tells the relation: `△` inheritance (solid line) or realization (dashed `╌`/`╎`), `◆` composition, `◇` aggregation, `▼` association (solid) or dependency (dashed), `○` a lollipop interface; a plain link meets the box with a junction (`┬`). Cardinalities sit just outside the box at their end, relation labels beside the line, notes in yellow cards with a dashed connector. Boxes can be focused and picked like flowchart nodes but not dragged. A diagram drawn smaller than it needs keeps every class name and cuts members first (`…`).
+
+```
+     ┌─────────────────┐       ┌────────────────────────────────┐
+     │    Customer     │       │          «interface»           │       ┌───────────────────┐
+     ├─────────────────┤       │            Payable             │       │ Total is cached   │
+     │ +string name    │       ├────────────────────────────────┤       │ after place()     │
+     │ +string email   │       │ +pay(Money amount) : bool      │       └───┬───────────────┘
+     │                 │       └───────────────△────────────────┘           ╎
+     └─────△─────┬─────┘                       ╎                            ╎
+           │   1 │          places             ╎                            ╎
+           │     ╰─────────────────────────╮   ╎    ╭╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╯
+           │                               │   ╎    ╎
+           │                               │ * ╎    ╎
+           │                           ┌───▼───┴────┴───┐
+           │                           │     Order      │
+     ┌─────┴───────────┐               ├────────────────┤          ┌───────────────┐
+     │   VipCustomer   │               │ +uuid id       │          │               │
+     ├─────────────────┤               │ +Money total   │          │     Cart      │
+     │ +int points     │               ├────────────────┤          │               │
+     └─────────────────┘               │ +place()       │          └──────────◇────┘
+                                       │ +cancel()      │                     │
+                                       └─────┬────◆─────┘                     │
+                                             ╎    │ 1                         │
+                                             ╎    │           contains        │
+                                    notifies ╎    ╰─────────────────────╮     │
+                                             ╎                        * │     │
+                                             ╎                    ┌─────┴─────┴─────┐
+                                     ┌───────▼───────────┐        │    LineItem     │
+                                     │      Mailer       │        ├─────────────────┤
+                                     ├───────────────────┤        │ +int qty        │
+                                     ├───────────────────┤        │ +Money price    │
+                                     │ +send(string to)  │        │                 │
+                                     └───────────────────┘        └─────────────────┘
+```
+*(`flowcli examples/class.mmd --preview`)*
 
 In a gitGraph each commit is a glyph on its lane: `●` normal, `■` `HIGHLIGHT`, `✕` `REVERSE`, `◉` merge. Branch names and tags are always drawn; commit ids are placed left to right and elided (`…`) or skipped when they would run into a neighbour — focus a commit with `Tab` to see its full id.
 

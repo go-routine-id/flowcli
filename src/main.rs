@@ -16,6 +16,7 @@
 mod render;
 mod update;
 
+use flowmaid::class::ClassScene;
 use flowmaid::gitgraph::GitScene;
 use flowmaid::model::{Document, Graph};
 use flowmaid::scene::Scene;
@@ -35,6 +36,9 @@ enum Built {
     GitGraph(GitScene),
     /// A sequence diagram: its own geometry, nothing to pick or drag.
     Sequence(SeqScene),
+    /// A class diagram: its scene plus the members, end glyphs,
+    /// cardinalities and notes the class overlay draws on top.
+    Class(ClassScene),
 }
 
 /// Drag state for a graph diagram: the moving node plus its base routing,
@@ -64,9 +68,11 @@ struct App {
     ids: Vec<String>,
     graph: Option<GraphState>,   // present ⇒ draggable
     git_scene: Option<GitScene>, // present ⇒ gitGraph label overlay
-    /// [`render::git_opts`] for `git_scene`, computed once per rebuild.
-    git_opts: Option<Opts>,
+    /// The finer scale a gitGraph ([`render::git_opts`]) or class diagram
+    /// ([`render::class_opts`]) is drawn at, computed once per rebuild.
+    fit_opts: Option<Opts>,
     seq_scene: Option<SeqScene>, // present ⇒ drawn by the sequence painter
+    class_scene: Option<ClassScene>, // present ⇒ class overlay
     drag: Option<Drag>,
     err: Option<String>,
 }
@@ -75,7 +81,7 @@ impl App {
     fn rebuild(&mut self) {
         match build(&self.src, self.compact) {
             Ok(built) => {
-                let (scene, graph, git_scene, seq_scene) = match built {
+                let (scene, graph, git_scene, seq_scene, class_scene) = match built {
                     Built::Graph { g, scene: fresh } => {
                         let ids: Vec<String> = fresh.nodes.iter().map(|n| n.id.clone()).collect();
                         let base_centers: Vec<(f64, f64)> =
@@ -95,15 +101,21 @@ impl App {
                             base_centers,
                             centers,
                         };
-                        (scene, Some(gs), None, None)
+                        (scene, Some(gs), None, None, None)
                     }
-                    Built::Plain(scene) => (scene, None, None, None),
-                    Built::GitGraph(gs) => (gs.scene.clone(), None, Some(gs), None),
+                    Built::Plain(scene) => (scene, None, None, None, None),
+                    Built::GitGraph(gs) => (gs.scene.clone(), None, Some(gs), None, None),
+                    // The real scene, so classes can be focused and picked.
+                    Built::Class(cs) => (cs.scene.clone(), None, None, None, Some(cs)),
                     // An empty scene of the same extent: picking and focus
                     // find nothing, the preview size rule still applies.
-                    Built::Sequence(sq) => {
-                        (Scene::empty(sq.width, sq.height), None, None, Some(sq))
-                    }
+                    Built::Sequence(sq) => (
+                        Scene::empty(sq.width, sq.height),
+                        None,
+                        None,
+                        Some(sq),
+                        None,
+                    ),
                 };
                 self.ids = scene.nodes.iter().map(|n| n.id.clone()).collect();
                 if let Some(f) = self.focus {
@@ -113,11 +125,17 @@ impl App {
                 }
                 self.scene = scene;
                 self.graph = graph;
-                self.git_opts = git_scene
+                self.fit_opts = git_scene
                     .as_ref()
-                    .map(|gs| render::git_opts(gs, &Opts::default()));
+                    .map(|gs| render::git_opts(gs, &Opts::default()))
+                    .or_else(|| {
+                        class_scene
+                            .as_ref()
+                            .map(|cs| render::class_opts(cs, &Opts::default()))
+                    });
                 self.git_scene = git_scene;
                 self.seq_scene = seq_scene;
+                self.class_scene = class_scene;
                 self.drag = None;
                 self.pick = None; // indices change on rebuild
                 self.err = None;
@@ -125,12 +143,13 @@ impl App {
             Err(e) => self.err = Some(e),
         }
     }
-    /// Draw/pick options. A gitGraph gets [`render::git_opts`] so draw,
-    /// label overlay and click picking all share one finer scale.
+    /// Draw/pick options. A gitGraph gets [`render::git_opts`] and a class
+    /// diagram [`render::class_opts`], so draw, overlay and click picking
+    /// all share one finer scale.
     fn opts(&self) -> Opts {
         Opts {
             highlight: self.focus.and_then(|i| self.ids.get(i)).cloned(),
-            ..self.git_opts.clone().unwrap_or_default()
+            ..self.fit_opts.clone().unwrap_or_default()
         }
     }
     /// Write the current node positions to `<path>.layout` so a dragged
@@ -218,7 +237,7 @@ fn build(mmd: &str, compact: Option<f64>) -> Result<Built, String> {
             }
         }),
         Document::Er(d) => Ok(Built::Plain(flowmaid::er::scene(&d).scene)),
-        Document::Class(d) => Ok(Built::Plain(flowmaid::class::scene(&d).scene)),
+        Document::Class(d) => Ok(Built::Class(flowmaid::class::scene(&d))),
         Document::GitGraph(d) => Ok(Built::GitGraph(flowmaid::gitgraph::scene(&d))),
         Document::Architecture(d) => Ok(Built::Plain(flowmaid::architecture::scene(&d).scene)),
         Document::Sequence(d) => Ok(Built::Sequence(flowmaid::seq::scene(&d))),
@@ -274,8 +293,9 @@ fn main() {
         ids: Vec::new(),
         graph: None,
         git_scene: None,
-        git_opts: None,
+        fit_opts: None,
         seq_scene: None,
+        class_scene: None,
         drag: None,
         err: None,
     };
@@ -294,6 +314,8 @@ fn main() {
         };
         let out = if let Some(sq) = &app.seq_scene {
             render::preview_seq(sq, cols, rows, &app.opts())
+        } else if let Some(cs) = &app.class_scene {
+            render::preview_class(cs, cols, rows, &app.opts())
         } else if let Some(gs) = &app.git_scene {
             render::preview_with_git(gs, cols, rows, &app.opts())
         } else {
@@ -386,6 +408,8 @@ fn run(app: &mut App) -> std::io::Result<()> {
                 );
             } else if let Some(sq) = &app.seq_scene {
                 render::draw_seq(f.buffer_mut(), inner, sq, &app.opts());
+            } else if let Some(cs) = &app.class_scene {
+                render::draw_class(f.buffer_mut(), inner, cs, &app.opts());
             } else {
                 render::draw(f.buffer_mut(), inner, &app.scene, &app.opts());
                 if let Some(gs) = &app.git_scene {
@@ -403,22 +427,28 @@ fn run(app: &mut App) -> std::io::Result<()> {
                     Span::raw(" reload"),
                 ]
             } else {
-                vec![
+                let mut keys = vec![
                     Span::styled(" q ", keycap),
                     Span::raw(" quit  "),
                     Span::styled(" Tab ", keycap),
                     Span::raw(" focus node  "),
                     Span::styled(" click ", keycap),
                     Span::raw(" pick  "),
-                    Span::styled(" drag ", keycap),
-                    Span::raw(" move node  "),
-                    Span::styled(" s ", keycap),
-                    Span::raw(" save layout  "),
-                    Span::styled(" c ", keycap),
-                    Span::raw(" compact  "),
-                    Span::styled(" r ", keycap),
-                    Span::raw(" reload"),
-                ]
+                ];
+                // Class boxes are static: no drag, no layout to save, and
+                // `build` ignores compact for them.
+                if app.class_scene.is_none() {
+                    keys.extend([
+                        Span::styled(" drag ", keycap),
+                        Span::raw(" move node  "),
+                        Span::styled(" s ", keycap),
+                        Span::raw(" save layout  "),
+                        Span::styled(" c ", keycap),
+                        Span::raw(" compact  "),
+                    ]);
+                }
+                keys.extend([Span::styled(" r ", keycap), Span::raw(" reload")]);
+                keys
             };
             let help = Paragraph::new(Line::from(keys)).style(Style::default().fg(Color::DarkGray));
             f.render_widget(help, help_row);
@@ -584,6 +614,7 @@ mod tests {
             Built::Graph { scene, .. } | Built::Plain(scene) => scene,
             Built::GitGraph(gs) => gs.scene,
             Built::Sequence(sq) => Scene::empty(sq.width, sq.height),
+            Built::Class(cs) => cs.scene,
         }
     }
 
@@ -955,5 +986,171 @@ mod tests {
             let out = render::preview_seq(&sq, c, r, &Opts::default());
             assert_eq!(out.lines().count(), r as usize);
         }
+    }
+
+    /// The class scene of a source, failing the test for any other type.
+    fn class_of(mmd: &str) -> ClassScene {
+        match build(mmd, None).unwrap() {
+            Built::Class(cs) => cs,
+            _ => panic!("not built as a class diagram"),
+        }
+    }
+
+    /// The class preview at the app's own scale.
+    fn class_preview(cs: &ClassScene, cols: u16, rows: u16) -> String {
+        render::preview_class(cs, cols, rows, &render::class_opts(cs, &Opts::default()))
+    }
+
+    #[test]
+    fn class_example_draws_members_glyphs_cards_labels_and_note() {
+        let cs = class_of(include_str!("../examples/class.mmd"));
+        let out = class_preview(&cs, 110, 34);
+        for text in [
+            "«interface»",
+            "+uuid id",
+            "+Money total",
+            "+place()",
+            "+string email",
+            "+pay(Money amount) : bool",
+            "+send(string to)",
+            "places",
+            "contains",
+            "notifies",
+            "Total is cached",
+            "after place()",
+        ] {
+            assert!(out.contains(text), "{text}:\n{out}");
+        }
+        // Compartment dividers, inheritance/realization triangles,
+        // composition and aggregation diamonds, a dependency arrow,
+        // dashed lines and the cardinalities.
+        for glyph in ['├', '△', '◆', '◇', '▼', '╎'] {
+            assert!(out.contains(glyph), "{glyph}:\n{out}");
+        }
+        assert!(out.contains(" 1 ") && out.contains(" * "), "{out}");
+    }
+
+    #[test]
+    fn class_draws_one_glyph_per_relation_kind() {
+        for (rel, glyph) in [
+            ("<|--", '△'),
+            ("<|..", '△'),
+            ("*--", '◆'),
+            ("o--", '◇'),
+            ("<--", '▲'),
+            ("<..", '▲'),
+        ] {
+            let cs = class_of(&format!("classDiagram\n  A {rel} B"));
+            let out = class_preview(&cs, 60, 30);
+            assert_eq!(out.matches(glyph).count(), 1, "{rel}:\n{out}");
+        }
+        // A plain link has no glyph, just junctions where it meets the boxes.
+        let cs = class_of("classDiagram\n  A -- B");
+        let out = class_preview(&cs, 60, 30);
+        assert!(!out.contains(['△', '▽', '◆', '◇', '▲', '▼']), "{out}");
+        assert!(out.contains('┬') && out.contains('┴'), "{out}");
+        // Two-way: a glyph at both ends.
+        let cs = class_of("classDiagram\n  A <|--|> B");
+        let out = class_preview(&cs, 60, 30);
+        assert!(out.contains('△') && out.contains('▽'), "{out}");
+    }
+
+    #[test]
+    fn class_dashes_realization_and_dependency_only() {
+        let dashed = |src: &str| class_preview(&class_of(src), 60, 30).contains('╎');
+        assert!(dashed("classDiagram\n  A <|.. B"));
+        assert!(dashed("classDiagram\n  A <.. B"));
+        assert!(!dashed("classDiagram\n  A <|-- B"));
+        assert!(!dashed("classDiagram\n  A <-- B"));
+    }
+
+    #[test]
+    fn class_dashed_plain_link_has_no_arrowhead() {
+        // `..` is dashed and undirected: no head, unlike `..>`.
+        let cs = class_of("classDiagram\n  A .. B : uses");
+        let out = class_preview(&cs, 60, 30);
+        assert!(!out.contains(['▲', '▼', '▶', '◀']), "{out}");
+        assert!(out.contains('╎') && out.contains("uses"), "{out}");
+        let cs = class_of("classDiagram\n  A ..> B");
+        assert_eq!(class_preview(&cs, 60, 30).matches('▼').count(), 1);
+    }
+
+    #[test]
+    fn class_generic_names_keep_their_parameter() {
+        // `I`/`B` type parameters are not `<i>`/`<b>` tags.
+        let cs = class_of("classDiagram\n  class Box~I~ {\n    +int x\n  }\n  class Repo~B~");
+        let out = class_preview(&cs, 60, 20);
+        assert!(out.contains("Box<I>") && out.contains("Repo<B>"), "{out}");
+    }
+
+    #[test]
+    fn class_wide_characters_fit_their_box() {
+        let cs = class_of("classDiagram\n  class A {\n    +String 名前データ\n    +int ok\n  }");
+        let out = class_preview(&cs, 60, 20);
+        assert!(out.contains("+String 名前データ"), "{out}");
+        // Every row keeps the grid's width, so the right border lines up.
+        let width = |l: &str| ratatui::text::Span::raw(l).width();
+        assert!(out.lines().all(|l| width(l) == 60), "{out}");
+        let right = |l: &str| width(&l[..l.rfind('│').unwrap()]);
+        let rows: Vec<_> = out.lines().filter(|l| l.contains('│')).map(right).collect();
+        assert!(rows.windows(2).all(|w| w[0] == w[1]), "{rows:?}\n{out}");
+    }
+
+    #[test]
+    fn class_lollipop_name_fits_its_spot() {
+        let cs = class_of("classDiagram\n  VeryLongInterfaceName ()-- foo\n  class bar");
+        let out = class_preview(&cs, 80, 20);
+        assert!(out.contains("VeryLongInterfaceName"), "{out}");
+        // A cramped area cuts the name instead of spilling it.
+        let opts = Opts {
+            sx: 40.0,
+            ..render::class_opts(&cs, &Opts::default())
+        };
+        let out = render::preview_class(&cs, 20, 10, &opts);
+        assert!(
+            out.lines()
+                .all(|l| ratatui::text::Span::raw(l).width() == 20),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn class_scale_is_never_coarser_than_default() {
+        let cs = class_of(include_str!("../examples/class.mmd"));
+        let o = render::class_opts(&cs, &Opts::default());
+        assert!(o.sx <= Opts::default().sx && o.sy <= Opts::default().sy);
+        assert!(o.sx > 0.0 && o.sy > 0.0);
+    }
+
+    #[test]
+    fn class_squeezed_box_keeps_its_name() {
+        let cs = class_of(include_str!("../examples/class.mmd"));
+        let out = class_preview(&cs, 110, 16);
+        for name in ["Customer", "Order", "LineItem", "Payable", "Mailer"] {
+            assert!(out.contains(name), "{name}:\n{out}");
+        }
+    }
+
+    #[test]
+    fn class_survives_tiny_areas() {
+        let cs = class_of(include_str!("../examples/class.mmd"));
+        for (c, r) in [(1, 1), (2, 1), (5, 3), (12, 6), (30, 10)] {
+            let out = class_preview(&cs, c, r);
+            assert_eq!(out.lines().count(), r as usize);
+        }
+    }
+
+    #[test]
+    fn class_boxes_can_be_focused() {
+        let cs = class_of(include_str!("../examples/class.mmd"));
+        let opts = Opts {
+            highlight: Some(cs.scene.nodes[0].id.clone()),
+            ..render::class_opts(&cs, &Opts::default())
+        };
+        let out = render::preview_class(&cs, 110, 34, &opts);
+        assert!(
+            out.contains("Customer") && out.contains("+string name"),
+            "{out}"
+        );
     }
 }

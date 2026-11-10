@@ -13,5 +13,21 @@ classDiagram
         +string name
         +string email
     }
+    class VipCustomer {
+        +int points
+    }
+    class Payable {
+        <<interface>>
+        +pay(Money amount) bool
+    }
+    class Cart
+    class Mailer {
+        +send(string to)$
+    }
     Customer "1" --> "*" Order : places
     Order "1" *-- "*" LineItem : contains
+    Customer <|-- VipCustomer
+    Payable <|.. Order
+    Cart o-- LineItem
+    Order ..> Mailer : notifies
+    note for Order "Total is cached\nafter place()"

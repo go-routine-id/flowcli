@@ -7,13 +7,15 @@
 //! real junctions (`├┼┴╮`) for edges, and arrowheads (`▶◀▲▼`) at the
 //! ends. Custom `style` colours (hex) become true-colour cells.
 
+use flowmaid::class::{ClassBox, ClassRow, ClassScene};
 use flowmaid::gitgraph::GitScene;
-use flowmaid::model::{FrameKind, SeqHead, Shape};
+use flowmaid::model::{FrameKind, RelKind, SeqHead, Shape};
 use flowmaid::scene::{Scene, SceneNode};
 use flowmaid::seq::{PartBox, SeqScene};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::Span;
 
 /// Rendering options. `sx`/`sy` are pixels-per-cell on each axis;
 /// terminal cells are roughly twice as tall as wide, so `sy ≈ 2·sx`
@@ -219,6 +221,14 @@ impl Grid {
 /// Draw `scene` into `area` of `buf`. This is the whole adapter — call
 /// it from any ratatui frame (or the headless [`preview`] for tests).
 pub fn draw(buf: &mut Buffer, area: Rect, scene: &Scene, opts: &Opts) {
+    draw_lines(buf, area, scene, opts, true);
+}
+
+/// [`draw`], optionally without arrowheads: diagrams whose ends carry
+/// their own notation (UML glyphs, cardinalities) draw every edge as a
+/// plain line, so a dashed edge's engine kind (`Dotted`, which counts as
+/// arrowed) never leaves a head their overlay would have to undo.
+fn draw_lines(buf: &mut Buffer, area: Rect, scene: &Scene, opts: &Opts, arrowheads: bool) {
     let cols = area.width as usize;
     let rows = area.height as usize;
     if cols == 0 || rows == 0 {
@@ -255,17 +265,7 @@ pub fn draw(buf: &mut Buffer, area: Rect, scene: &Scene, opts: &Opts) {
     let mut box_of: std::collections::HashMap<&str, (i64, i64, i64, i64)> =
         std::collections::HashMap::new();
     for n in &scene.nodes {
-        let x0 = cx(n.x - n.w / 2.0);
-        let mut x1 = cx(n.x + n.w / 2.0);
-        let y0 = cy(n.y - n.h / 2.0);
-        let mut y1 = cy(n.y + n.h / 2.0);
-        if x1 - x0 < 2 {
-            x1 = x0 + 2;
-        }
-        if y1 - y0 < 2 {
-            y1 = y0 + 2;
-        }
-        box_of.insert(n.id.as_str(), (x0, y0, x1, y1));
+        box_of.insert(n.id.as_str(), cell_box(n, cx, cy));
     }
 
     // 2) Edges → connection bits (skip invisible ranking links). Collect
@@ -295,7 +295,8 @@ pub fn draw(buf: &mut Buffer, area: Rect, scene: &Scene, opts: &Opts) {
         // head on that face's border cell, pointing square in (issue #6:
         // aiming at the box centre turned heads sideways on wide, short
         // boxes); the line is cut back to meet it.
-        let entry = if e.kind.has_arrow() {
+        let arrowed = arrowheads && e.kind.has_arrow();
+        let entry = if arrowed {
             by_id
                 .get(e.to.as_str())
                 .zip(box_of.get(e.to.as_str()))
@@ -335,7 +336,7 @@ pub fn draw(buf: &mut Buffer, area: Rect, scene: &Scene, opts: &Opts) {
                 col,
                 bold: !faded,
             });
-        } else if e.kind.has_arrow() {
+        } else if arrowed {
             // Fallback (no box face, e.g. a cluster target or an end off
             // the frame): the last polyline cell OUTSIDE the target node
             // box, pointing toward it. Placed after nodes are drawn.
@@ -456,6 +457,21 @@ pub fn draw(buf: &mut Buffer, area: Rect, scene: &Scene, opts: &Opts) {
 
     // 6) Blit the grid into the ratatui buffer.
     blit(&g, buf, area);
+}
+
+/// A node's cell box `(x0, y0, x1, y1)` (borders included), at least
+/// 2×2 so it has an inside. Shared by [`draw`] and the class overlay so
+/// both paint the same cells.
+fn cell_box(
+    n: &SceneNode,
+    cx: impl Fn(f64) -> i64,
+    cy: impl Fn(f64) -> i64,
+) -> (i64, i64, i64, i64) {
+    let x0 = cx(n.x - n.w / 2.0);
+    let y0 = cy(n.y - n.h / 2.0);
+    let x1 = cx(n.x + n.w / 2.0).max(x0 + 2);
+    let y1 = cy(n.y + n.h / 2.0).max(y0 + 2);
+    (x0, y0, x1, y1)
 }
 
 /// Copy the painted cells of `g` into `area` of `buf`.
@@ -878,8 +894,13 @@ fn render_text(cols: u16, rows: u16, paint: impl FnOnce(&mut Buffer, Rect)) -> S
     let buf = term.backend().buffer().clone();
     let mut out = String::new();
     for y in 0..rows {
-        for x in 0..cols {
-            out.push_str(buf[(x, y)].symbol());
+        let mut x = 0;
+        while x < cols {
+            let sym = buf[(x, y)].symbol();
+            out.push_str(sym);
+            // A wide glyph covers the next cell too; skip that cell so the
+            // text line keeps the grid's width.
+            x += (cells(sym) as u16).max(1);
         }
         out.push('\n');
     }
@@ -1201,4 +1222,627 @@ pub fn draw_seq(buf: &mut Buffer, area: Rect, sc: &SeqScene, opts: &Opts) {
 /// Headless render of a sequence diagram — `--preview` and tests.
 pub fn preview_seq(sc: &SeqScene, cols: u16, rows: u16, opts: &Opts) -> String {
     render_text(cols, rows, |buf, area| draw_seq(buf, area, sc, opts))
+}
+
+// ---------------------------------------------------------------------
+// Class diagrams
+// ---------------------------------------------------------------------
+
+/// Colours of the class overlay. Box borders and lines keep the generic
+/// painter's colours (the node's `style`, else its shape's); these are
+/// for the text it adds.
+const CLASS_ANNOTATION: Color = Color::Magenta;
+const CLASS_MEMBER: Color = Color::Gray;
+const CLASS_REL_LABEL: Color = Color::White;
+const CLASS_CARD: Color = Color::LightBlue;
+const CLASS_NOTE: Color = Color::Yellow;
+
+/// Cells a box's outline can lose to rounding its two faces separately,
+/// on top of the two border cells (both axes).
+const BOX_FRAME_CELLS: f64 = 2.0;
+/// Blank cells between a member row and the box's side borders (one
+/// each side).
+const BOX_TEXT_PAD_CELLS: f64 = 2.0;
+
+/// One text row of a class box, top to bottom.
+enum ClassLine<'a> {
+    Annotation(&'a str),
+    Name,
+    Divider,
+    Member(&'a ClassRow),
+    /// Stands in for the rows cut when the box is squeezed.
+    More,
+}
+
+/// The rows a class box is drawn with: stereotypes, the name, then the
+/// attribute and operation compartments, each opened by a divider. The
+/// attribute compartment is kept (empty) when only operations exist,
+/// so operations always sit in the second one, as in UML.
+fn class_lines(b: &ClassBox) -> Vec<ClassLine<'_>> {
+    let mut v: Vec<ClassLine> = b
+        .annotations
+        .iter()
+        .map(|a| ClassLine::Annotation(a))
+        .collect();
+    v.push(ClassLine::Name);
+    if !b.fields.is_empty() || !b.methods.is_empty() {
+        v.push(ClassLine::Divider);
+        v.extend(b.fields.iter().map(ClassLine::Member));
+    }
+    if !b.methods.is_empty() {
+        v.push(ClassLine::Divider);
+        v.extend(b.methods.iter().map(ClassLine::Member));
+    }
+    v
+}
+
+/// [`class_lines`] cut to `room` rows for a squeezed box, least
+/// telling first: the empty attribute compartment, then stereotypes,
+/// then trailing members (an `…` row marks the cut). The name stays.
+fn class_lines_within(b: &ClassBox, room: usize) -> Vec<ClassLine<'_>> {
+    let mut v = class_lines(b);
+    if room <= 1 {
+        return vec![ClassLine::Name];
+    }
+    if v.len() > room && b.fields.is_empty() && !b.methods.is_empty() {
+        if let Some(k) = v.iter().position(|l| matches!(l, ClassLine::Divider)) {
+            v.remove(k);
+        }
+    }
+    if v.len() > room {
+        v.retain(|l| !matches!(l, ClassLine::Annotation(_)));
+    }
+    if v.len() > room {
+        v.truncate(room - 1);
+        while matches!(v.last(), Some(ClassLine::Divider)) {
+            v.pop();
+        }
+        v.push(ClassLine::More);
+    }
+    v
+}
+
+/// A class's name as drawn: verbatim on one line. Not [`flat_label`] —
+/// a generic `Box<I>` or `Repo<B>` would lose its parameter as an
+/// `<i>`/`<b>` tag.
+fn class_name(b: &ClassBox) -> String {
+    b.name.replace('\n', " ")
+}
+
+fn class_line_text<'a>(b: &'a ClassBox, l: &ClassLine<'a>) -> &'a str {
+    match l {
+        ClassLine::Annotation(a) => a,
+        ClassLine::Name => &b.name,
+        ClassLine::Divider => "",
+        ClassLine::Member(r) => &r.text,
+        ClassLine::More => "…",
+    }
+}
+
+/// Options for drawing a class diagram. The engine sizes a box by its
+/// proportional text width and 20 px per member row, both finer than a
+/// terminal cell at the default scale, so members would be cut or not
+/// drawn at all. Picks the coarsest scale (never coarser than `base`)
+/// at which every class box gives each of its rows one cell row and its
+/// widest row a padded fit, and every note fits its lines the same way.
+/// The two axes are fitted separately. Compute once per scene and reuse
+/// it for draw and picking.
+pub fn class_opts(cs: &ClassScene, base: &Opts) -> Opts {
+    // (node, widest row in cells, rows, frame + padding cells).
+    let classes = cs.boxes.iter().zip(&cs.scene.nodes).map(|(b, n)| {
+        if b.lollipop {
+            // Frameless: just the name on one row.
+            return (n, cells(&class_name(b)), 1, 0.0);
+        }
+        let lines = class_lines(b);
+        let widest = lines
+            .iter()
+            .map(|l| cells(class_line_text(b, l)))
+            .max()
+            .unwrap_or(0);
+        (n, widest, lines.len(), BOX_FRAME_CELLS)
+    });
+    let notes = cs
+        .notes
+        .iter()
+        .zip(cs.scene.nodes.iter().skip(cs.boxes.len()))
+        .map(|(nb, n)| {
+            let widest = nb.text.split('\n').map(cells).max();
+            let rows = nb.text.split('\n').count();
+            (n, widest.unwrap_or(0), rows, BOX_FRAME_CELLS)
+        });
+    let (mut sx, mut sy) = (base.sx, base.sy);
+    for (n, widest, rows, frame) in classes.chain(notes) {
+        let pad = if frame > 0.0 { BOX_TEXT_PAD_CELLS } else { 0.0 };
+        if n.w > 0.0 && widest > 0 {
+            sx = sx.min(n.w / (widest as f64 + pad + frame));
+        }
+        if n.h > 0.0 {
+            sy = sy.min(n.h / (rows as f64 + frame));
+        }
+    }
+    Opts {
+        sx,
+        sy,
+        ..base.clone()
+    }
+}
+
+/// The end glyph of a relationship entering a box in direction `dir`
+/// (pointing into it): hollow triangles for inheritance/realization,
+/// diamonds for composition/aggregation, filled arrows for
+/// association/dependency, a circle for a lollipop; a plain link has none.
+fn rel_glyph(kind: RelKind, dir: u8) -> Option<char> {
+    use RelKind::*;
+    match kind {
+        Inheritance | Realization => Some(match dir {
+            DN => '▽',
+            UP => '△',
+            RT => '▷',
+            _ => '◁',
+        }),
+        Composition => Some('◆'),
+        Aggregation => Some('◇'),
+        Association | Dependency => Some(arrow_glyph(dir)),
+        Lollipop => Some('○'),
+        Link => None,
+    }
+}
+
+/// The border glyph where a line meets a box face, entering in `dir`.
+fn face_junction(dir: u8) -> char {
+    match dir {
+        DN => '┴',
+        UP => '┬',
+        RT => '┤',
+        _ => '├',
+    }
+}
+
+/// Cell-addressed writes into `area` of a ratatui buffer, clipped to it.
+struct Canvas<'a> {
+    buf: &'a mut Buffer,
+    area: Rect,
+}
+
+impl Canvas<'_> {
+    fn at(&self, c: i64, r: i64) -> Option<(u16, u16)> {
+        let (x, y) = (self.area.x as i64 + c, self.area.y as i64 + r);
+        (c >= 0 && r >= 0 && x < self.area.right() as i64 && y < self.area.bottom() as i64)
+            .then_some((x as u16, y as u16))
+    }
+    fn symbol(&self, c: i64, r: i64) -> Option<&str> {
+        self.at(c, r).map(|p| self.buf[p].symbol())
+    }
+    fn blank(&self, c: i64, r: i64) -> bool {
+        self.symbol(c, r) == Some(" ")
+    }
+    fn put(&mut self, c: i64, r: i64, ch: char, style: Style) {
+        if let Some(p) = self.at(c, r) {
+            let mut b = [0u8; 4];
+            self.buf[p]
+                .set_symbol(ch.encode_utf8(&mut b))
+                .set_style(style);
+        }
+    }
+    /// Swap the symbol only, keeping the cell's colours.
+    fn swap(&mut self, c: i64, r: i64, ch: char) {
+        if let Some(p) = self.at(c, r) {
+            let mut b = [0u8; 4];
+            self.buf[p].set_symbol(ch.encode_utf8(&mut b));
+        }
+    }
+    /// Write `s` from `(c, r)`: a wide character takes its cell and
+    /// blanks the next, as ratatui lays it; zero-width ones are dropped.
+    fn text(&mut self, c: i64, r: i64, s: &str, style: Style) {
+        let mut at = c;
+        for ch in s.chars() {
+            let w = char_cells(ch);
+            if w == 0 {
+                continue;
+            }
+            // A wide glyph clipped by the right edge would spill past it.
+            if w == 2 && self.at(at + 1, r).is_none() {
+                break;
+            }
+            self.put(at, r, ch, style);
+            if w == 2 {
+                // Its second cell is hidden behind it — reset, as ratatui does.
+                if let Some(p) = self.at(at + 1, r) {
+                    self.buf[p].reset();
+                }
+            }
+            at += w;
+        }
+    }
+}
+
+fn styled(fg: Color, bold: bool) -> Style {
+    let s = Style::default().fg(fg);
+    if bold {
+        s.add_modifier(Modifier::BOLD)
+    } else {
+        s
+    }
+}
+
+/// Terminal cells `ch` takes: two for wide (CJK, emoji) characters,
+/// none for zero-width ones.
+fn char_cells(ch: char) -> i64 {
+    cells(ch.encode_utf8(&mut [0u8; 4]))
+}
+
+/// Terminal cells `s` takes.
+fn cells(s: &str) -> i64 {
+    Span::raw(s).width() as i64
+}
+
+/// `s` cut to `cells` terminal cells, the last one `…` when cut.
+fn fit(s: &str, room: i64) -> String {
+    if cells(s) <= room {
+        return s.to_string();
+    }
+    if room <= 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in s.chars() {
+        let w = char_cells(ch);
+        if used + w > room - 1 {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
+/// The cells an edge's polyline steps through, in order — the same
+/// walk [`draw`] lays its line along.
+fn path_cells(pts: &[(i64, i64)]) -> Vec<(i64, i64)> {
+    let mut out: Vec<(i64, i64)> = pts.first().copied().into_iter().collect();
+    for w in pts.windows(2) {
+        let (mut c, mut r) = w[0];
+        while (c, r) != w[1] {
+            let (dc, dr) = (w[1].0 - c, w[1].1 - r);
+            if dc.abs() >= dr.abs() {
+                c += dc.signum();
+            } else {
+                r += dr.signum();
+            }
+            out.push((c, r));
+        }
+    }
+    out
+}
+
+/// Where an edge meets a box: the cell and the direction pointing in.
+type FaceEnd = ((i64, i64), u8);
+
+/// Draw a class diagram: the generic boxes and lines, then the class
+/// overlay — compartments, UML end glyphs, cardinalities, relation
+/// labels, dashed lines and notes. `opts` should come from
+/// [`class_opts`] (as the app's do).
+pub fn draw_class(buf: &mut Buffer, area: Rect, cs: &ClassScene, opts: &Opts) {
+    draw_lines(buf, area, &cs.scene, opts, false);
+    draw_class_overlay(buf, area, cs, opts);
+}
+
+fn draw_class_overlay(buf: &mut Buffer, area: Rect, cs: &ClassScene, opts: &Opts) {
+    use flowmaid::model::EdgeKind;
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let sc = &cs.scene;
+    let (sx, sy) = scale(sc, area.width, area.height, opts);
+    let cx = |x: f64| (x / sx).round() as i64;
+    let cy = |y: f64| (y / sy).round() as i64;
+    let mut cv = Canvas { buf, area };
+    let boxes: Vec<_> = sc.nodes.iter().map(|n| cell_box(n, cx, cy)).collect();
+    let index: std::collections::HashMap<&str, usize> = sc
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.id.as_str(), i))
+        .collect();
+    let in_box = |c: (i64, i64)| {
+        boxes
+            .iter()
+            .any(|&(x0, y0, x1, y1)| c.0 >= x0 && c.0 <= x1 && c.1 >= y0 && c.1 <= y1)
+    };
+    let outside_interiors = |c: (i64, i64)| {
+        boxes
+            .iter()
+            .all(|&(x0, y0, x1, y1)| c.0 <= x0 || c.0 >= x1 || c.1 <= y0 || c.1 >= y1)
+    };
+    let focus = opts.highlight.as_deref();
+    let faded_node = |i: usize| focus.is_some_and(|h| h != sc.nodes[i].id);
+
+    // 1) Dashed lines: realization / dependency, and note connectors.
+    let paths: Vec<Vec<(i64, i64)>> = sc
+        .edges
+        .iter()
+        .map(|e| {
+            let pts: Vec<_> = edge_points(e)
+                .iter()
+                .map(|&(x, y)| (cx(x), cy(y)))
+                .collect();
+            path_cells(&pts)
+        })
+        .collect();
+    for (e, path) in sc.edges.iter().zip(&paths) {
+        if !matches!(e.kind, EdgeKind::Dotted | EdgeKind::DottedOpen) {
+            continue;
+        }
+        for &(c, r) in path.iter().filter(|&&c| !in_box(c)) {
+            match cv.symbol(c, r) {
+                Some("─") => cv.swap(c, r, '╌'),
+                Some("│") => cv.swap(c, r, '╎'),
+                _ => {}
+            }
+        }
+    }
+
+    // 2) Class boxes: compartments, or just the name for a lollipop.
+    for (i, (b, n)) in cs.boxes.iter().zip(&sc.nodes).enumerate() {
+        let (x0, y0, x1, y1) = boxes[i];
+        let faded = faded_node(i);
+        let tint = |c: Color| if faded { Color::DarkGray } else { c };
+        let bold = !faded && focus.is_some();
+        let name_style = styled(tint(label_color(n)), !faded);
+        if b.lollipop {
+            for r in y0..=y1 {
+                for c in x0..=x1 {
+                    cv.put(c, r, ' ', Style::default());
+                }
+            }
+            // Cut to its rect, which `class_opts` sizes to fit the name.
+            let name = fit(&class_name(b), x1 - x0 + 1);
+            let start = x0 + (x1 - x0 + 1 - cells(&name)).max(0) / 2;
+            cv.text(start, cy(n.y), &name, name_style);
+            continue;
+        }
+        let border = styled(tint(node_color(n)), bold);
+        for r in (y0 + 1)..y1 {
+            for c in (x0 + 1)..x1 {
+                cv.put(c, r, ' ', Style::default());
+            }
+        }
+        let inner = x1 - x0 - 1;
+        let room = (y1 - y0 - 1).max(0) as usize;
+        let lines = class_lines_within(b, room);
+        let centred = |cv: &mut Canvas, r: i64, s: &str, style: Style| {
+            let s = fit(s, inner);
+            let start = x0 + 1 + (inner - cells(&s)).max(0) / 2;
+            cv.text(start, r, &s, style);
+        };
+        // A lone name sits on the middle row, as `draw` puts labels.
+        let top = if lines.len() == 1 {
+            (y0 + y1) / 2
+        } else {
+            y0 + 1
+        };
+        for (k, l) in lines.iter().enumerate() {
+            let r = top + k as i64;
+            match l {
+                ClassLine::Annotation(a) => {
+                    centred(&mut cv, r, a, styled(tint(CLASS_ANNOTATION), false))
+                }
+                ClassLine::Name => centred(&mut cv, r, &class_name(b), name_style),
+                ClassLine::Divider => {
+                    cv.put(x0, r, '├', border);
+                    for c in (x0 + 1)..x1 {
+                        cv.put(c, r, '─', border);
+                    }
+                    cv.put(x1, r, '┤', border);
+                }
+                ClassLine::Member(row) => {
+                    let mut style = styled(tint(CLASS_MEMBER), false);
+                    if row.is_static {
+                        style = style.add_modifier(Modifier::UNDERLINED);
+                    }
+                    if row.is_abstract {
+                        style = style.add_modifier(Modifier::ITALIC);
+                    }
+                    cv.text(x0 + 2, r, &fit(&row.text, inner - 2), style);
+                }
+                ClassLine::More => centred(&mut cv, r, "…", styled(tint(CLASS_MEMBER), false)),
+            }
+        }
+    }
+
+    // 3) Notes: a yellow card with its lines left-aligned.
+    for (k, nb) in cs.notes.iter().enumerate() {
+        let i = cs.boxes.len() + k;
+        let Some(&(x0, y0, x1, y1)) = boxes.get(i) else {
+            continue;
+        };
+        let faded = faded_node(i);
+        let col = if faded { Color::DarkGray } else { CLASS_NOTE };
+        let style = styled(col, false);
+        let bold = !faded && focus.is_some();
+        let edge = styled(col, bold);
+        for c in (x0 + 1)..x1 {
+            cv.put(c, y0, '─', edge);
+            cv.put(c, y1, '─', edge);
+        }
+        for r in (y0 + 1)..y1 {
+            cv.put(x0, r, '│', edge);
+            cv.put(x1, r, '│', edge);
+            for c in (x0 + 1)..x1 {
+                cv.put(c, r, ' ', Style::default());
+            }
+        }
+        for (c, r, ch) in [(x0, y0, '┌'), (x1, y0, '┐'), (x0, y1, '└'), (x1, y1, '┘')] {
+            cv.put(c, r, ch, edge);
+        }
+        let inner = x1 - x0 - 1;
+        let lines: Vec<String> = nb.text.split('\n').map(flat_label).collect();
+        if lines.len() as i64 > y1 - y0 - 1 {
+            cv.text(
+                x0 + 2,
+                (y0 + y1) / 2,
+                &fit(&lines.join(" "), inner - 2),
+                style,
+            );
+        } else {
+            for (k, l) in lines.iter().enumerate() {
+                cv.text(x0 + 2, y0 + 1 + k as i64, &fit(l, inner - 2), style);
+            }
+        }
+    }
+
+    // 4) End glyphs (or a junction where a line meets a face plainly),
+    // remembered per end for the cardinalities.
+    let mut ends: Vec<[Option<FaceEnd>; 2]> = Vec::with_capacity(sc.edges.len());
+    for (j, e) in sc.edges.iter().enumerate() {
+        let raw = edge_points(e);
+        let pts: Vec<_> = raw.iter().map(|&(x, y)| (cx(x), cy(y))).collect();
+        let rel = cs.rels.get(j);
+        let faded = focus.is_some() && !edge_touches(e, focus);
+        let line = if faded {
+            Color::DarkGray
+        } else {
+            index
+                .get(e.from.as_str())
+                .map(|&i| node_color(&sc.nodes[i]))
+                .unwrap_or(Color::Gray)
+        };
+        let mut pair = [None, None];
+        for (side, (id, at)) in [(&e.from, raw.first()), (&e.to, raw.last())]
+            .into_iter()
+            .enumerate()
+        {
+            let Some((&i, &at)) = index.get(id.as_str()).zip(at) else {
+                continue;
+            };
+            // Where the line meets the face, as `draw` puts arrowheads;
+            // else the polyline's last cell off every box interior.
+            let face = face_entry(&sc.nodes[i], boxes[i], at, sx, sy)
+                .filter(|&(cell, _)| outside_interiors(cell));
+            let end = face.or_else(|| {
+                let (x0, y0, x1, y1) = boxes[i];
+                let off = |c: &&(i64, i64)| outside_interiors(**c);
+                let anchor = *if side == 0 {
+                    pts.iter().find(off)
+                } else {
+                    pts.iter().rev().find(off)
+                }?;
+                let d = step_dir(anchor, ((x0 + x1) / 2, (y0 + y1) / 2));
+                (d != 0).then_some((anchor, d))
+            });
+            let Some((cell, dir)) = end else {
+                continue;
+            };
+            pair[side] = Some((cell, dir));
+            let kind = rel.and_then(|r| if side == 0 { r.from_kind } else { Some(r.kind) });
+            match kind.and_then(|k| rel_glyph(k, dir)) {
+                Some(g) => cv.put(cell.0, cell.1, g, styled(line, !faded)),
+                // A plain end on a face: the border opens into the line.
+                None if face.is_some() && matches!(cv.symbol(cell.0, cell.1), Some("─" | "│")) => {
+                    cv.swap(cell.0, cell.1, face_junction(dir))
+                }
+                None => {}
+            }
+        }
+        ends.push(pair);
+    }
+
+    // 5) Cardinalities beside their end, just outside the box, on the
+    // side the engine put them; then relation labels beside the line.
+    let free = |cv: &Canvas, c: i64, r: i64, n: i64| (0..n).all(|k| cv.blank(c + k, r));
+    let clear_of_boxes = |c: i64, r: i64, n: i64| (0..n).all(|k| !in_box((c + k, r)));
+    let place = |cv: &mut Canvas, cands: &[(i64, i64)], s: &str, style: Style| {
+        let n = cells(s);
+        let spot = cands
+            .iter()
+            .find(|&&(c, r)| free(cv, c, r, n))
+            .or_else(|| cands.iter().find(|&&(c, r)| clear_of_boxes(c, r, n)));
+        if let Some(&(c, r)) = spot {
+            cv.text(c, r, s, style);
+        }
+    };
+    let spots = flowmaid::class::card_spots(cs);
+    for (j, rel) in cs.rels.iter().enumerate() {
+        let e = &sc.edges[j];
+        let faded = focus.is_some() && !edge_touches(e, focus);
+        let style = styled(if faded { Color::DarkGray } else { CLASS_CARD }, false);
+        for (side, card) in [&rel.from_card, &rel.to_card].into_iter().enumerate() {
+            let Some(card) = card.as_deref().map(flat_label) else {
+                continue;
+            };
+            let n = cells(&card);
+            let spot = spots.get(j).and_then(|s| s[side]);
+            let cands = match ends.get(j).and_then(|p| p[side]) {
+                Some(((c, r), dir)) => {
+                    // `before`: the engine put the card left of (above) the end.
+                    let before = spot.is_some_and(|(x, y)| match dir {
+                        DN | UP => x < c as f64 * sx,
+                        _ => y < r as f64 * sy,
+                    });
+                    let (a, b) = match dir {
+                        DN => ((c - 1 - n, r - 1), (c + 2, r - 1)),
+                        UP => ((c - 1 - n, r + 1), (c + 2, r + 1)),
+                        RT => ((c - n, r - 1), (c - n, r + 1)),
+                        _ => ((c + 1, r - 1), (c + 1, r + 1)),
+                    };
+                    if before {
+                        vec![a, b]
+                    } else {
+                        vec![b, a]
+                    }
+                }
+                None => spot
+                    .map(|(x, y)| vec![(cx(x) - n / 2, cy(y))])
+                    .unwrap_or_default(),
+            };
+            place(&mut cv, &cands, &card, style);
+        }
+    }
+    for (e, path) in sc.edges.iter().zip(&paths) {
+        let Some((text, (x, y), _)) = &e.label else {
+            continue;
+        };
+        let text = flat_label(text);
+        if text.is_empty() {
+            continue;
+        }
+        let n = cells(&text);
+        let faded = focus.is_some() && !edge_touches(e, focus);
+        let style = styled(
+            if faded {
+                Color::DarkGray
+            } else {
+                CLASS_REL_LABEL
+            },
+            false,
+        );
+        let (lc, lr) = (cx(*x), cy(*y));
+        let near = path
+            .iter()
+            .filter(|&&c| !in_box(c))
+            .min_by_key(|&&(c, r)| (c - lc).abs() + (r - lr).abs())
+            .copied();
+        let mut cands = Vec::new();
+        if let Some((c, r)) = near {
+            let vertical = matches!(cv.symbol(c, r), Some("│" | "╎"));
+            let beside = [(c + 2, r), (c - 1 - n, r)];
+            let over = [(c - n / 2, r - 1), (c - n / 2, r + 1)];
+            if vertical {
+                cands.extend(beside.into_iter().chain(over));
+            } else {
+                cands.extend(over.into_iter().chain(beside));
+            }
+        }
+        cands.push((lc - n / 2, lr));
+        place(&mut cv, &cands, &text, style);
+    }
+}
+
+/// Headless render of a class diagram, overlay included. `opts` should
+/// come from [`class_opts`] (as the app's do).
+pub fn preview_class(cs: &ClassScene, cols: u16, rows: u16, opts: &Opts) -> String {
+    render_text(cols, rows, |buf, area| draw_class(buf, area, cs, opts))
 }
