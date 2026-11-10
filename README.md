@@ -99,6 +99,16 @@ you; if you downloaded the binary by hand through a browser, clear it yourself:
 xattr -d com.apple.quarantine /usr/local/bin/flowcli
 ```
 
+### As a Herdr plugin
+
+If you run AI coding agents in [Herdr](https://github.com/herdrdev/herdr), install flowcli as a plugin instead. It brings its own binary, so nothing above is needed:
+
+```sh
+herdr plugin install go-routine-id/flowcli/herdr
+```
+
+See [Herdr plugin](#herdr-plugin-diagrams-next-to-your-ai-agent) for what it needs and how to use it.
+
 ### Build from source
 
 ```sh
@@ -164,7 +174,12 @@ A click is only logged. The agent reads the log when you refer to the diagram, s
 herdr plugin install go-routine-id/flowcli/herdr
 ```
 
-The install downloads the prebuilt release matching the checked-out `Cargo.toml` version into the plugin's own `bin/` and verifies its checksum, so it needs no Rust toolchain and no `sudo` (macOS and Linux). Herdr keeps one plugin registry per session, so run the install in each named session where you want it.
+The install downloads the prebuilt release matching the checked-out `Cargo.toml` version into the plugin's own `bin/` and verifies its checksum, so it needs no Rust toolchain and no `sudo`.
+
+- **Needs**: Herdr 0.9.0 or newer, on macOS or Linux, with `git`, `curl` and `bash` available.
+- **Per session**: Herdr keeps one plugin registry per session, so run the install in each named session where you want it.
+- **Check it**: `herdr plugin list --plugin flowcli` shows the plugin, its version and where it lives.
+- **Remove it**: `herdr plugin uninstall flowcli`. To move to a newer version, uninstall and install again.
 
 - **Open a diagram** (what the agent runs; the path must be absolute):
   ```sh
@@ -172,7 +187,13 @@ The install downloads the prebuilt release matching the checked-out `Cargo.toml`
     --placement split --direction right --no-focus --env FLOWCLI_FILE=/abs/path/flow.mmd
   ```
   `--no-focus` leaves focus with the agent's pane. The selection log defaults to `<file>.events.jsonl`; set `FLOWCLI_EVENTS` to put it elsewhere.
-- **Open the newest `.mmd` in the focused pane's folder**: the `open-diagram` action, for example `herdr plugin action invoke open-diagram --plugin flowcli`, or bound to a key in Herdr's config.
+- **Open the newest `.mmd` in the focused pane's folder**: the `open-diagram` action, for example `herdr plugin action invoke open-diagram --plugin flowcli`. To put it on a key, add this to Herdr's `config.toml` (pick any free key) and run `herdr server reload-config`:
+  ```toml
+  [[keys.command]]
+  key = "prefix+alt+d"
+  type = "shell"
+  command = "herdr plugin action invoke open-diagram --plugin flowcli"
+  ```
 - **Teach your agent**: [`herdr/skill/SKILL.md`](herdr/skill/SKILL.md) tells an agent how to draw, open the pane, check that a save parsed, and read the selection. Plugin installs don't copy skills. For Claude Code, copy it yourself:
   ```sh
   mkdir -p ~/.claude/skills/flowcli
