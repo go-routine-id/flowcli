@@ -12,7 +12,7 @@
 //! · c toggle compact (serpentine) layout · r reload the file.
 //! Mouse: left-click picks whatever is under the cursor — node (focus
 //! it), edge, or cluster — via the engine's `Scene::hit_test`; drag a
-//! node to move it, edges re-route live via `route_partial` (flowchart
+//! node to move it, edges re-route live via `route_sized_with` (flowchart
 //! and state diagrams). Sequence diagrams are static: only q and r apply.
 //!
 //! `--watch` re-reads the file when it changes on disk (an editor or an
@@ -43,12 +43,16 @@ use std::time::{Duration, Instant};
 const WATCH_INTERVAL: Duration = Duration::from_millis(150);
 
 /// The parsed diagram. `Graph` diagrams (flowchart/state, non-compact)
-/// keep their source graph so nodes can be dragged and re-routed live via
-/// `route_partial`; everything else is a static `Plain` scene.
+/// are laid out with terminal-sized boxes ([`mono_sizes`]) and keep their
+/// source graph so nodes can be dragged and re-routed live; everything
+/// else is a static `Plain` scene.
 enum Built {
     Graph {
         g: Box<Graph>,
         scene: Scene,
+        /// Node sizes for one cell per character ([`mono_sizes`]),
+        /// which every re-route must reuse.
+        sizes: Vec<(f64, f64)>,
     },
     Plain(Scene),
     GitGraph(GitScene),
@@ -62,13 +66,33 @@ enum Built {
     Er(ErScene),
 }
 
-/// Drag state for a graph diagram: the moving node plus its base routing,
-/// so `route_partial` re-routes only the edges the drag touches.
+/// Drag state for a graph diagram. A drag re-routes the whole graph with
+/// the terminal-sized boxes (`route_sized_with`): flowmaid's partial
+/// re-route only takes its own label estimate, whose boxes are too
+/// narrow here, and a full route stays in the low milliseconds even for
+/// a hundred nodes.
 struct GraphState {
     g: Graph,
-    base: Scene,
-    base_centers: Vec<(f64, f64)>,
-    centers: Vec<(f64, f64)>, // current centres (mutated while dragging)
+    sizes: Vec<(f64, f64)>,
+    base_centers: Vec<(f64, f64)>, // the auto layout's, to tell moved nodes
+    centers: Vec<(f64, f64)>,      // current centres (mutated while dragging)
+}
+
+/// Re-route `g` with its nodes centred at `centers`, boxes sized as built.
+fn route(g: &Graph, centers: &[(f64, f64)], sizes: &[(f64, f64)]) -> Scene {
+    flowmaid::scene::route_sized_with(g, centers, sizes, render::mono_measure)
+}
+
+/// Node sizes for a terminal: labels measured one cell per character
+/// and wrapped where the engine wraps them, so every box holds its text
+/// at the default scale.
+fn mono_sizes(g: &Graph) -> Vec<(f64, f64)> {
+    g.nodes
+        .iter()
+        .map(|n| {
+            flowmaid::layout::intrinsic_size_wrapped(n, g.wrapping_width(), render::mono_measure)
+        })
+        .collect()
 }
 
 /// An in-progress node drag.
@@ -169,7 +193,11 @@ impl App {
     fn apply(&mut self, built: Built, keep: &[(String, (f64, f64))]) {
         let focused = self.focus.and_then(|i| self.ids.get(i)).cloned();
         let (scene, graph, git_scene, seq_scene, class_scene, er_scene) = match built {
-            Built::Graph { g, scene: fresh } => {
+            Built::Graph {
+                g,
+                scene: fresh,
+                sizes,
+            } => {
                 let ids: Vec<String> = fresh.nodes.iter().map(|n| n.id.clone()).collect();
                 let base_centers: Vec<(f64, f64)> =
                     fresh.nodes.iter().map(|n| (n.x, n.y)).collect();
@@ -186,13 +214,13 @@ impl App {
                     }
                 }
                 let scene = if moved {
-                    flowmaid::scene::route_partial(&g, &centers, &fresh, &base_centers)
+                    route(&g, &centers, &sizes)
                 } else {
-                    fresh.clone()
+                    fresh
                 };
                 let gs = GraphState {
                     g: *g,
-                    base: fresh,
+                    sizes,
                     base_centers,
                     centers,
                 };
@@ -413,8 +441,7 @@ impl App {
         if let Some(gs) = &mut self.graph {
             if node < gs.centers.len() {
                 gs.centers[node] = (x + off.0, y + off.1);
-                self.scene =
-                    flowmaid::scene::route_partial(&gs.g, &gs.centers, &gs.base, &gs.base_centers);
+                self.scene = route(&gs.g, &gs.centers, &gs.sizes);
             }
         }
     }
@@ -456,15 +483,24 @@ fn load_layout(path: &str, ids: &[String], centers: &mut [(f64, f64)]) -> bool {
 fn build(mmd: &str, compact: Option<f64>) -> Result<Built, String> {
     match flowmaid::parser::parse_document(mmd).map_err(|e| e.to_string())? {
         Document::Flowchart(g) | Document::State(g) => Ok(match compact {
+            // Folded with the same terminal-sized boxes. Labels are still
+            // wrapped by the engine's estimate here (the sized fold takes
+            // no measure), so one 23–28 characters long may end in `…`.
             Some(px) => Built::Plain(
-                flowmaid::fold::scene_compact(&g, &flowmaid::fold::CompactOptions::for_extent(px))
-                    .scene,
+                flowmaid::fold::scene_compact_sized(
+                    &g,
+                    &mono_sizes(&g),
+                    &flowmaid::fold::CompactOptions::for_extent(px),
+                )
+                .scene,
             ),
             None => {
-                let scene = flowmaid::scene::scene(&g);
+                let sizes = mono_sizes(&g);
+                let scene = flowmaid::scene::scene_sized_with(&g, &sizes, render::mono_measure);
                 Built::Graph {
                     g: Box::new(g),
                     scene,
+                    sizes,
                 }
             }
         }),
@@ -1050,20 +1086,22 @@ mod tests {
     }
 
     #[test]
-    fn dragging_a_node_reroutes_only_its_own_edges() {
-        // A graph diagram keeps its source graph, so a drag can re-route
-        // via route_partial — the second half of pick → drag → route.
-        let Built::Graph { g, scene } = build("flowchart TD\nA --> B --> C", None).unwrap() else {
+    fn dragging_a_node_moves_it_and_keeps_every_box_size() {
+        // A graph diagram keeps its source graph and terminal-sized boxes,
+        // so a drag re-routes with them — the second half of
+        // pick → drag → route.
+        let Built::Graph { g, scene, sizes } = build("flowchart TD\nA --> B --> C", None).unwrap()
+        else {
             panic!("flowchart should stay a draggable graph");
         };
         let base_centers: Vec<(f64, f64)> = scene.nodes.iter().map(|n| (n.x, n.y)).collect();
         let mut centers = base_centers.clone();
         // Shove B sideways by 200px and re-route.
         centers[1].0 += 200.0;
-        let moved = flowmaid::scene::route_partial(&g, &centers, &scene, &base_centers);
+        let moved = route(&g, &centers, &sizes);
         assert_eq!(moved.nodes.len(), scene.nodes.len());
         // B moved ~200px relative to A (compare deltas so any global
-        // canvas shift inside route_partial cancels out)...
+        // canvas shift inside the router cancels out)...
         let base_rel = scene.nodes[1].x - scene.nodes[0].x;
         let moved_rel = moved.nodes[1].x - moved.nodes[0].x;
         assert!(
@@ -1074,6 +1112,85 @@ mod tests {
         let base_ac = scene.nodes[2].x - scene.nodes[0].x;
         let moved_ac = moved.nodes[2].x - moved.nodes[0].x;
         assert!((moved_ac - base_ac).abs() < 1.0, "unmoved nodes stay put");
+        // A drag never shrinks a box back to the proportional-font size.
+        for (a, b) in scene.nodes.iter().zip(&moved.nodes) {
+            assert_eq!((a.w, a.h), (b.w, b.h), "box of {} kept", a.id);
+        }
+    }
+
+    /// Every label line of `scene`'s nodes, tags stripped.
+    fn label_lines(scene: &Scene) -> Vec<String> {
+        scene
+            .nodes
+            .iter()
+            .flat_map(|n| n.label.split('\n').map(str::to_string).collect::<Vec<_>>())
+            .map(|l| {
+                flowmaid::layout::spans(&l)
+                    .into_iter()
+                    .map(|(t, ..)| t)
+                    .collect::<String>()
+            })
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn labels_fit_their_boxes_at_the_default_scale() {
+        // Room enough that nothing is scaled down: every label, wrapped
+        // or not, must be drawn whole — one cell per character.
+        for src in [
+            std::fs::read_to_string("examples/pipeline.mmd").unwrap(),
+            std::fs::read_to_string("examples/state.mmd").unwrap(),
+            "flowchart LR\nUser[User] --> Web[Web App] --> API[API Gateway]\n\
+             API --> Order[Order Service] --> DB[(Postgres)]\n\
+             Install[install.sh] --> Release[v0.2.0 release]"
+                .to_string(),
+        ] {
+            let sc = scene_of(&src, None);
+            let out = render::preview(&sc, 400, 120, &Opts::default());
+            for line in label_lines(&sc) {
+                assert!(out.contains(&line), "label {line:?} cut in:\n{out}");
+            }
+            assert!(!out.contains('…'), "nothing elided at full size");
+        }
+    }
+
+    #[test]
+    fn long_labels_wrap_and_every_line_is_drawn() {
+        let src = "flowchart LR\nA[This label is long enough to wrap onto lines] --> B[ok]";
+        let sc = scene_of(src, None);
+        let a = &sc.nodes[0];
+        assert!(
+            a.label.contains('\n'),
+            "the engine wrapped it: {:?}",
+            a.label
+        );
+        let out = render::preview(&sc, 200, 60, &Opts::default());
+        for line in a.label.split('\n') {
+            assert!(out.contains(line), "line {line:?} missing in:\n{out}");
+        }
+    }
+
+    #[test]
+    fn wide_characters_fit_their_box() {
+        let sc = scene_of("flowchart LR\nA[表示テスト] --> B[Käse → 東京]", None);
+        let out = render::preview(&sc, 200, 40, &Opts::default());
+        // ratatui's text dump pads a wide glyph's hidden second cell with
+        // a space, so compare with those spaces removed.
+        let flat: String = out.chars().filter(|c| *c != ' ').collect();
+        assert!(flat.contains("表示テスト"), "{out}");
+        assert!(flat.contains("Käse→東京"), "{out}");
+    }
+
+    #[test]
+    fn a_label_that_cannot_fit_ends_in_an_ellipsis() {
+        // Squeezed far below the default scale: boxes shrink, so labels
+        // must show they were cut instead of silently losing letters.
+        let src = "flowchart LR\nA[Authentication Service] --> B[Order Processing Service] --> C[Notification Service]";
+        let sc = scene_of(src, None);
+        let out = render::preview(&sc, 40, 10, &Opts::default());
+        assert!(out.contains('…'), "{out}");
+        assert!(!out.contains("Authentication Service"), "really squeezed");
     }
 
     /// A unique temp path for a test file, so parallel or concurrent

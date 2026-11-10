@@ -32,15 +32,34 @@ pub struct Opts {
     pub git: bool,
 }
 
+/// Scene px one terminal cell spans at the default scale, across and
+/// down. Down matches flowmaid's label line height (`layout::LINE_H`),
+/// so each wrapped label line gets a row of its own.
+pub const CELL_W: f64 = 8.5;
+pub const CELL_H: f64 = 17.0;
+
 impl Default for Opts {
     fn default() -> Self {
         Opts {
-            sx: 8.5,
-            sy: 17.0,
+            sx: CELL_W,
+            sy: CELL_H,
             highlight: None,
             git: false,
         }
     }
+}
+
+/// Width of one label line as a terminal draws it — one cell per
+/// character, two for wide ones — in scene px at the default scale.
+/// flowmaid's own estimate measures a proportional font, about a fifth
+/// narrower, so boxes laid out with it can't hold their labels here;
+/// lay graphs out with this instead (`scene_sized_with` and friends).
+pub fn mono_measure(line: &str) -> f64 {
+    let text: String = flowmaid::layout::spans(line)
+        .into_iter()
+        .map(|(t, ..)| t)
+        .collect();
+    cells(&text) as f64 * CELL_W
 }
 
 /// Options for drawing a gitGraph. The engine packs commit columns by its
@@ -207,6 +226,25 @@ impl Grid {
         }
         if let Some(i) = self.idx(c as usize, r as usize) {
             self.cells[i] = Some(Cell { ch, fg, bold });
+        }
+    }
+    /// Write `s` from `(c, r)`: a wide character takes two cells (the
+    /// second left unpainted, as a terminal lays it out), zero-width
+    /// ones are dropped.
+    fn text(&mut self, c: i64, r: i64, s: &str, fg: Color, bold: bool) {
+        let mut at = c;
+        for ch in s.chars() {
+            let w = char_cells(ch);
+            if w == 0 {
+                continue;
+            }
+            self.put(at, r, ch, fg, bold);
+            if w == 2 && at + 1 >= 0 && r >= 0 {
+                if let Some(i) = self.idx((at + 1) as usize, r as usize) {
+                    self.cells[i] = None;
+                }
+            }
+            at += w;
         }
     }
     fn add_bit(&mut self, c: i64, r: i64, bit: u8) {
@@ -438,16 +476,31 @@ fn draw_lines(buf: &mut Buffer, area: Rect, scene: &Scene, opts: &Opts, arrowhea
                 g.put(c, r, ' ', col, false);
             }
         }
-        let inner = (x1 - x0 - 1).max(0) as usize;
-        let label = flowmaid::layout::spans(n.label.split('\n').next().unwrap_or(""))
-            .into_iter()
-            .map(|(t, ..)| t)
-            .collect::<String>();
-        let label: String = label.chars().take(inner).collect();
-        let start = x0 + 1 + ((inner.saturating_sub(label.chars().count())) / 2) as i64;
-        let ymid = (y0 + y1) / 2;
-        for (k, ch) in label.chars().enumerate() {
-            g.put(start + k as i64, ymid, ch, text_col, focus);
+        // Every label line the box has a row for, centred both ways. A
+        // line too long for the box, or the last one shown when more
+        // don't fit, ends in `…` so a cut never passes for the label.
+        let inner = (x1 - x0 - 1).max(0);
+        let rows = (y1 - y0 - 1).max(1);
+        let lines: Vec<String> = n
+            .label
+            .split('\n')
+            .map(|l| {
+                flowmaid::layout::spans(l)
+                    .into_iter()
+                    .map(|(t, ..)| t)
+                    .collect()
+            })
+            .collect();
+        let shown = lines.len().min(rows as usize);
+        let top = y0 + 1 + (rows - shown as i64) / 2;
+        for (k, line) in lines.iter().take(shown).enumerate() {
+            let text = if k + 1 == shown && shown < lines.len() {
+                fit_more(line, inner)
+            } else {
+                fit(line, inner)
+            };
+            let start = x0 + 1 + (inner - cells(&text)) / 2;
+            g.text(start, top + k as i64, &text, text_col, focus);
         }
     }
 
@@ -1476,6 +1529,16 @@ fn char_cells(ch: char) -> i64 {
 /// Terminal cells `s` takes.
 fn cells(s: &str) -> i64 {
     Span::raw(s).width() as i64
+}
+
+/// `s` followed by `…` within `room` cells — for the last label line
+/// shown when more lines follow — cut further if it doesn't fit.
+fn fit_more(s: &str, room: i64) -> String {
+    if cells(s) < room {
+        format!("{s}…")
+    } else {
+        fit(s, room)
+    }
 }
 
 /// `s` cut to `cells` terminal cells, the last one `…` when cut.
