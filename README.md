@@ -5,52 +5,49 @@
 flowcli is a [ratatui](https://ratatui.rs) front-end for the flowmaid diagram engine. It exists to prove one thing: flowmaid's `scene` API is **renderer-agnostic**. The engine hands out plain geometry — node rectangles, edge polylines, cluster boxes, labels — and never assumes SVG. flowcli takes that same geometry and paints it onto a character grid. One ~350-line adapter, and the very diagrams you'd export to SVG appear as `╭─╮ │ ╰─╯` in your shell.
 
 ```text
-           ╭────────────────╮
-           │  Terima order  │
-           ╰────────────────╯
-                    │
-                    │
-         ┌──────────▼──────────┐
-         │                     │
-         │     Stok cukup?     │
-         │                     │
-         └─────────────────────┘
-           ╭──────╯   │
-           │          ╰─────╮
-           │                │
-   ┌───────▼───────┐        │
-   │ Reserve stok  │        │
-   │               │        │
-   └───────────────┘        │
-           │                │
-           │                │
-   ┌───────▼───────┐        │
-   │ Buat invoice  │        │
-   └───────────────┘        │
-           │                │
-           │                │
-           │                │
-    ┌──────▼──────┐         │
-    │             │         │
-    │   Bayar?    │         │
-    │             │         │
-    └─────────────┘         │
-           │  ╰────────╮    │
-           │           │    │
-           │           │    │
-      ┌────▼────┐     ┌▼────▼──────┐
-      │ Simpan  │     │ Backorder  │
-      │         │     │            │
-      └─────────┘     └────────────┘
-           │
-           │
-           │
-           ▼
-
-           ●
-
-
-         Kirim
+           ╭─────────────╮
+           │Terima order │
+           ╰─────────────╯
+                  │
+                  │
+         ┌────────▼─────────┐
+         │                  │
+         │   Stok cukup?    │
+         │                  │
+         └──────────────────┘
+          ╭─────╯   │
+          │         ╰─────╮
+          │               │
+   ┌──────▼──────┐        │
+   │Reserve stok │        │
+   │             │        │
+   └─────────────┘        │
+          │               │
+          │               │
+    ┌─────▼─────┐         │
+    │Buat invoi…│         │
+    └───────────┘         │
+          │               │
+          │               │
+          │               │
+   ┌──────▼─────┐         │
+   │            │         │
+   │   Bayar?   │         │
+   │            │         │
+   └────────────┘         │
+          │ ╰─────────╮   │
+          │           │   │
+          │           │   │
+     ┌────▼────┐     ┌▼───▼─────┐
+     │ Simpan  │     │Backorder │
+     │         │     │          │
+     └─────────┘     └──────────┘
+          │
+          │
+          │
+          ▼
+          ●
+        Kirim
 ```
 
 *(Above: `flowcli examples.mmd --preview`. In a real terminal the boxes are true-colour — diamonds render yellow, cylinders blue, start/stop nodes green — and arrowheads point along the flow.)*
@@ -199,18 +196,18 @@ The `.events.jsonl` and `.layout` files sit next to your diagrams; add both patt
 
 Clicking runs the diagram's geometry through `Scene::hit_test` ([flowmaid #17](https://github.com/go-routine-id/flowmaid/issues/17)): the terminal cell is mapped back to a scene pixel and the engine reports the node, edge, or cluster under it — a node pick lights up focus, an edge or cluster shows in the title bar. Zoom/pan never enter the engine; the same picking API a web canvas would call drives a *pure-terminal* renderer, which is the whole point — if the geometry were wrong, the click would miss.
 
-**Dragging** grabs the picked node and moves it: each mouse-move feeds the new centres to `route_sized_with`, which re-routes the graph with the same terminal-sized boxes it was laid out with (see *How it works*). A full route stays in the low milliseconds even for a hundred nodes, far below a frame. flowmaid's partial `route_partial`, the live-drag path [flowmaid-desktop](https://github.com/go-routine-id/flowmaid-desktop) uses, only takes the engine's own label estimate, whose boxes would shrink back mid-drag. That closes the editor loop the engine was built for: **pick → drag → route**, all on the renderer-agnostic scene. (Nodes snap to the character grid, so movement is chunky by a cell — which is itself proof the routing holds up at low resolution.) Drag works on flowchart and state diagrams, the ones that carry a source graph; ER, class, gitGraph, architecture, sequence, and the folded `--compact` view stay static.
+**Dragging** grabs the picked node and moves it: each mouse-move feeds the new centre to `route_partial`, which re-routes *only* the edges touching that node and preserves the rest — the same live-drag path [flowmaid-desktop](https://github.com/go-routine-id/flowmaid-desktop) uses, now in a terminal. That closes the editor loop the engine was built for: **pick → drag → route**, all on the renderer-agnostic scene. (Nodes snap to the character grid, so movement is chunky by a cell — which is itself proof the routing holds up at low resolution.) Drag works on flowchart and state diagrams, the ones that carry a source graph; ER, class, gitGraph, architecture, sequence, and the folded `--compact` view stay static.
 
 **Saving** (`s`) writes the current node positions to a `<file>.layout` sidecar — one `<id> <x> <y>` line per node — which is read back the next time you open the file, so a hand-tuned arrangement persists. Why a sidecar and not the `.mmd` itself? Mermaid has *no syntax for absolute node positions*, so a layout can't round-trip through the source; the `.mmd` stays canonical mermaid and the positions live alongside it. (For persisting the diagram's *structure* after a structural edit, that's what the engine's `to_mermaid` is for — flowcli only edits layout, so it uses the sidecar.)
 
 Focus mode uses each node's `SceneNode.id` ([flowmaid #13](https://github.com/go-routine-id/flowmaid/issues/13)) to keep one node bright while dimming the rest — no re-layout, just a colour pass. Compact mode reflows a tall chain into a space-filling serpentine via `fold::scene_compact` ([flowmaid #15](https://github.com/go-routine-id/flowmaid/issues/15)):
 
 ```text
-                  ╭─────────╮────────╮────────────╮────────────╮──────────╮───────╮─────────╮
-                  │         │        │            │            │          │       │         │
-    ┌────┐    ┌───────┐  ┌──▼──┐  ┌──▼───┐  ┌─────▼─────┐  ┌───▼────┐  ┌──▼──┐  ┌─▼─┐  ┌────▼─────┐  ┌─────┐
-    │Clo…│    │Format…│  │Clip…│  │Unit …│  │Integratio…│  │Build r…│  │Pack…│  │Si…│  │Upload ar…│  │Publ…│
-    └────┘    └───▲───┘  └─────┘  └──────┘  └───────────┘  └────────┘  └─────┘  └───┘  └──────────┘  └──▲──┘
+                  ╭──────────╮────────╮───────────╮───────────╮──────────╮────────╮─────────╮
+                  │          │        │           │           │          │        │         │
+    ┌────┐    ┌────────┐  ┌──▼──┐  ┌──▼───┐  ┌────▼────┐  ┌───▼────┐  ┌──▼───┐  ┌─▼─┐   ┌───▼────┐   ┌─────┐
+    │Clo…│    │Format …│  │Clip…│  │Unit …│  │Integrat…│  │Build r…│  │Packa…│  │Si…│   │Upload …│   │Publ…│
+    └────┘    └───▲────┘  └─────┘  └──────┘  └─────────┘  └────────┘  └──────┘  └───┘   └────────┘   └──▲──┘
       │           │                                                                         │           │
       │           │                                                                         │           │
       │           │                                                                         │           │
@@ -225,21 +222,21 @@ Focus mode uses each node's `SceneNode.id` ([flowmaid #13](https://github.com/go
 
 ## How it works
 
-flowmaid lays the graph out and returns a `Scene` of pure geometry in f64 pixels:
+flowmaid's `scene::scene(&graph)` returns a `Scene` of pure geometry in f64 pixels:
 
 - **node rectangles** (`x, y, w, h`, a `Shape`, an `id`, and optional hex `style`),
 - **edge polylines** — routed channel `waypoints` when present, otherwise a cubic `bezier` to sample,
 - **cluster boxes** and **labels**.
 
-The engine sizes boxes for a proportional font by default, which is about a fifth narrower than a terminal's one cell per character, so labels wouldn't fit. flowcli lays flowcharts and state diagrams out with its own measure instead (`render::mono_measure`, fed to flowmaid's `intrinsic_size_wrapped` and `scene_sized_with`). Every box then holds its label at the default scale, and long labels wrap onto lines of their own.
-
-flowcli's `src/render.rs` maps that onto a terminal cell grid. Because terminal cells are about twice as tall as they are wide, it scales the two axes independently (`sy ≈ 2·sx`) to keep the diagram's proportions. A diagram wider or taller than the terminal is scaled down to fit, and then a label that no longer fits its box ends in `…` rather than losing letters silently. Then:
+flowcli's `src/render.rs` maps that onto a terminal cell grid. Because terminal cells are about twice as tall as they are wide, it scales the two axes independently (`sy ≈ 2·sx`) to keep the diagram's proportions. A diagram larger than the terminal is scaled down to fit. Then:
 
 1. **Cluster boxes** are drawn first, behind everything.
 2. **Edges** are walked cell-by-cell; each step records connection bits (up/down/left/right) so a later pass can bake real junctions — `├ ┼ ┴ ╮` — instead of dumb crossings.
-3. **Node boxes** are stamped on top with `┌─┐ │ └─┘` (square) or `╭─╮ │ ╰─╯` (rounded, for stadium/circle shapes), then every label line the box has room for is centred inside.
+3. **Node boxes** are stamped on top with `┌─┐ │ └─┘` (square) or `╭─╮ │ ╰─╯` (rounded, for stadium/circle shapes), then every label line the box has a row for is centred inside. A line that doesn't fit its box, or the last one shown when more are left out, ends in `…`, so a cut label never passes for the whole one. Text is laid out by grapheme, so CJK characters take two cells and an emoji sequence like 👨‍👩‍👧 stays one glyph.
 4. **Arrowheads** (`▶ ◀ ▲ ▼`) land last, on the last polyline cell outside the target box, pointing at it.
 5. Custom `style` strokes/colours (`#rrggbb`) become **true-colour** cells.
+
+Labels can still end in `…` at full size. The engine sizes boxes for a proportional font, about a fifth narrower than one cell per character. Laying flowcharts out with a terminal measure needs a measure-aware partial re-route in flowmaid first, so that a drag doesn't redraw edges it never touched.
 
 That is the entire adapter. It never touches SVG, never re-implements layout — it consumes the same `Scene` the SVG backend does. That is the point: **the engine produces geometry; renderers are interchangeable.** flowmaid stays a zero-dependency library; flowcli is the ~350 lines that turn its geometry into text.
 

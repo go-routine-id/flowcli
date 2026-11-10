@@ -33,10 +33,10 @@ pub struct Opts {
 }
 
 /// Scene px one terminal cell spans at the default scale, across and
-/// down. Down matches flowmaid's label line height (`layout::LINE_H`),
-/// so each wrapped label line gets a row of its own.
+/// down. Down IS flowmaid's label line height, so each wrapped label
+/// line the engine adds to a box adds a row it can be drawn on.
 pub const CELL_W: f64 = 8.5;
-pub const CELL_H: f64 = 17.0;
+pub const CELL_H: f64 = flowmaid::layout::LINE_H;
 
 impl Default for Opts {
     fn default() -> Self {
@@ -49,17 +49,23 @@ impl Default for Opts {
     }
 }
 
-/// Width of one label line as a terminal draws it — one cell per
-/// character, two for wide ones — in scene px at the default scale.
-/// flowmaid's own estimate measures a proportional font, about a fifth
-/// narrower, so boxes laid out with it can't hold their labels here;
-/// lay graphs out with this instead (`scene_sized_with` and friends).
-pub fn mono_measure(line: &str) -> f64 {
-    let text: String = flowmaid::layout::spans(line)
+/// One label line as plain text: `<b>`/`<i>` tags and other markup
+/// interpreted away, as the engine measures it.
+pub fn plain_line(line: &str) -> String {
+    flowmaid::layout::spans(line)
         .into_iter()
         .map(|(t, ..)| t)
-        .collect();
-    cells(&text) as f64 * CELL_W
+        .collect()
+}
+
+/// A whole (possibly wrapped, possibly `<b>`-tagged) label as one plain
+/// line — for a single row of cells, and for what `--events` reports.
+pub fn plain_label(label: &str) -> String {
+    label
+        .split('\n')
+        .map(plain_line)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Options for drawing a gitGraph. The engine packs commit columns by its
@@ -204,6 +210,10 @@ struct Grid {
     cols: usize,
     rows: usize,
     cells: Vec<Option<Cell>>,
+    /// Full grapheme clusters (a ZWJ emoji, `❤️`, a letter with its
+    /// combining accent) for the few cells whose glyph is more than the
+    /// one `char` a [`Cell`] holds, by cell index.
+    clusters: std::collections::HashMap<usize, String>,
     /// Accumulated edge connection bits, before line glyphs are baked.
     bits: Vec<u8>,
 }
@@ -214,6 +224,7 @@ impl Grid {
             cols,
             rows,
             cells: vec![None; cols * rows],
+            clusters: std::collections::HashMap::new(),
             bits: vec![0; cols * rows],
         }
     }
@@ -226,22 +237,33 @@ impl Grid {
         }
         if let Some(i) = self.idx(c as usize, r as usize) {
             self.cells[i] = Some(Cell { ch, fg, bold });
+            if !self.clusters.is_empty() {
+                self.clusters.remove(&i);
+            }
         }
     }
-    /// Write `s` from `(c, r)`: a wide character takes two cells (the
-    /// second left unpainted, as a terminal lays it out), zero-width
-    /// ones are dropped.
+    /// Write `s` from `(c, r)` by [`graphemes`]: a wide glyph takes two
+    /// cells (the second left unpainted, as a terminal lays it out), and
+    /// one that would spill past the grid's right edge is not drawn.
     fn text(&mut self, c: i64, r: i64, s: &str, fg: Color, bold: bool) {
+        if r < 0 {
+            return;
+        }
         let mut at = c;
-        for ch in s.chars() {
-            let w = char_cells(ch);
-            if w == 0 {
-                continue;
+        for (g, w) in graphemes(s) {
+            if at + w > self.cols as i64 {
+                break;
             }
-            self.put(at, r, ch, fg, bold);
-            if w == 2 && at + 1 >= 0 && r >= 0 {
-                if let Some(i) = self.idx((at + 1) as usize, r as usize) {
-                    self.cells[i] = None;
+            if at >= 0 {
+                let mut chars = g.chars();
+                self.put(at, r, chars.next().unwrap_or(' '), fg, bold);
+                if let Some(i) = self.idx(at as usize, r as usize) {
+                    if chars.next().is_some() {
+                        self.clusters.insert(i, g.clone());
+                    }
+                    if w == 2 {
+                        self.cells[i + 1] = None; // in the grid: checked above
+                    }
                 }
             }
             at += w;
@@ -287,14 +309,10 @@ fn draw_lines(buf: &mut Buffer, area: Rect, scene: &Scene, opts: &Opts, arrowhea
         let (x0, y0) = (cx(cl.x), cy(cl.y));
         let (x1, y1) = (cx(cl.x + cl.w), cy(cl.y + cl.h));
         rect(&mut g, x0, y0, x1, y1, Color::DarkGray, false, false);
-        for (k, ch) in cl
-            .title
-            .chars()
-            .take((x1 - x0 - 2).max(0) as usize)
-            .enumerate()
-        {
-            g.put(x0 + 2 + k as i64, y0, ch, Color::DarkGray, false);
-        }
+        // One row on the frame: a multi-line title is joined, and one
+        // too long for the frame ends in `…` instead of losing letters.
+        let title = fit(&plain_label(&cl.title), x1 - x0 - 2);
+        g.text(x0 + 2, y0, &title, Color::DarkGray, false);
     }
 
     // 1b) Node cell-boxes up front — edges need them for arrowheads,
@@ -447,21 +465,24 @@ fn draw_lines(buf: &mut Buffer, area: Rect, scene: &Scene, opts: &Opts, arrowhea
         }
 
         // Circle nodes (outside gitGraph, which returned above) are drawn
-        // as a compact marker with the label underneath.
+        // as a compact marker with the label right under it: every line
+        // the circle's box has rows for, as wide as the box, the last
+        // shown ending in `…` when lines are left out.
         if n.shape == Shape::Circle {
             let cx = (x0 + x1) / 2;
             let cy = (y0 + y1) / 2;
             g.put(cx, cy, '●', col, focus);
-            let label = flowmaid::layout::spans(n.label.split('\n').next().unwrap_or(""))
-                .into_iter()
-                .map(|(t, ..)| t)
-                .collect::<String>();
-            if !label.is_empty() {
-                let start = cx - (label.chars().count() as i64) / 2;
-                let label_y = y1 + 1;
-                for (k, ch) in label.chars().enumerate() {
-                    g.put(start + k as i64, label_y, ch, text_col, focus);
-                }
+            let lines: Vec<String> = n.label.split('\n').map(plain_line).collect();
+            let room = x1 - x0 + 1;
+            let shown = lines.len().min((y1 - cy).max(1) as usize);
+            for (k, line) in lines.iter().take(shown).enumerate() {
+                let text = if k + 1 == shown && shown < lines.len() {
+                    fit_more(line, room)
+                } else {
+                    fit(line, room)
+                };
+                let start = cx - cells(&text) / 2;
+                g.text(start, cy + 1 + k as i64, &text, text_col, focus);
             }
             continue;
         }
@@ -481,16 +502,7 @@ fn draw_lines(buf: &mut Buffer, area: Rect, scene: &Scene, opts: &Opts, arrowhea
         // don't fit, ends in `…` so a cut never passes for the label.
         let inner = (x1 - x0 - 1).max(0);
         let rows = (y1 - y0 - 1).max(1);
-        let lines: Vec<String> = n
-            .label
-            .split('\n')
-            .map(|l| {
-                flowmaid::layout::spans(l)
-                    .into_iter()
-                    .map(|(t, ..)| t)
-                    .collect()
-            })
-            .collect();
+        let lines: Vec<String> = n.label.split('\n').map(plain_line).collect();
         let shown = lines.len().min(rows as usize);
         let top = y0 + 1 + (rows - shown as i64) / 2;
         for (k, line) in lines.iter().take(shown).enumerate() {
@@ -541,9 +553,11 @@ fn blit(g: &Grid, buf: &mut Buffer, area: Rect) {
                         style = style.add_modifier(Modifier::BOLD);
                     }
                     let mut b = [0u8; 4];
-                    buf[(x, y)]
-                        .set_symbol(cell.ch.encode_utf8(&mut b))
-                        .set_style(style);
+                    let symbol = match g.clusters.get(&(r * g.cols + c)) {
+                        Some(cluster) => cluster.as_str(),
+                        None => cell.ch.encode_utf8(&mut b),
+                    };
+                    buf[(x, y)].set_symbol(symbol).set_style(style);
                 }
             }
         }
@@ -995,25 +1009,9 @@ pub fn seq_scale(sc: &SeqScene, cols: u16, rows: u16, opts: &Opts) -> (f64, f64)
     (sx, sy)
 }
 
-/// Plain text of a (possibly multi-line, possibly `<b>`-tagged) label,
-/// on one line — terminal cells hold one row of text per element.
-fn flat_label(s: &str) -> String {
-    s.split('\n')
-        .map(|l| {
-            flowmaid::layout::spans(l)
-                .into_iter()
-                .map(|(t, ..)| t)
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 /// Write `text` starting at cell `(c, r)`, clipped to the grid.
 fn put_text(g: &mut Grid, c: i64, r: i64, text: &str, fg: Color, bold: bool) {
-    for (k, ch) in text.chars().enumerate() {
-        g.put(c + k as i64, r, ch, fg, bold);
-    }
+    g.text(c, r, text, fg, bold);
 }
 
 /// Cell box `(x0, y0, x1, y1)` for a scene rectangle, grown (about its
@@ -1067,7 +1065,7 @@ pub fn draw_seq(buf: &mut Buffer, area: Rect, sc: &SeqScene, opts: &Opts) {
     // grid can't draw: give it a plain box's height (same top edge) so
     // it doesn't swallow the first message row.
     let part_box = |b: &PartBox| {
-        let label = flat_label(&b.label);
+        let label = plain_label(&b.label);
         let h = b.h.min(flowmaid::seq::BOX_H);
         let bx = text_box((b.x, b.y, b.w, h), label.chars().count() as i64, cx, cy);
         (bx, label)
@@ -1094,7 +1092,7 @@ pub fn draw_seq(buf: &mut Buffer, area: Rect, sc: &SeqScene, opts: &Opts) {
         rect(&mut g, x0, y0, x1, y1, SEQ_GUIDE, false, false);
         let inner = (x1 - x0 - 1).max(0) as usize;
         let chip = |kw: &str, label: &str| {
-            let label = flat_label(label);
+            let label = plain_label(label);
             let s = if label.is_empty() {
                 format!("[{kw}]")
             } else {
@@ -1151,7 +1149,7 @@ pub fn draw_seq(buf: &mut Buffer, area: Rect, sc: &SeqScene, opts: &Opts) {
             ('─', '│')
         };
         let label = {
-            let text = flat_label(&m.text);
+            let text = plain_label(&m.text);
             match m.number {
                 Some(n) if text.is_empty() => format!("{n}."),
                 Some(n) => format!("{n}. {text}"),
@@ -1222,7 +1220,7 @@ pub fn draw_seq(buf: &mut Buffer, area: Rect, sc: &SeqScene, opts: &Opts) {
     // tall at this scale, a one-row `▌ text ▐` band so the card's
     // borders don't spill onto the rows around it.
     for n in &sc.notes {
-        let text = flat_label(&n.text);
+        let text = plain_label(&n.text);
         let w = text.chars().count() as i64;
         if cy(n.y + n.h) - cy(n.y) < 2 {
             let start = cx(n.x + n.w / 2.0) - (w + 4) / 2;
@@ -1356,7 +1354,7 @@ fn class_lines_within(b: &ClassBox, room: usize) -> Vec<ClassLine<'_>> {
     v
 }
 
-/// A class's name as drawn: verbatim on one line. Not [`flat_label`] —
+/// A class's name as drawn: verbatim on one line. Not [`plain_label`] —
 /// a generic `Box<I>` or `Repo<B>` would lose its parameter as an
 /// `<i>`/`<b>` tag.
 fn class_name(b: &ClassBox) -> String {
@@ -1486,20 +1484,18 @@ impl Canvas<'_> {
             self.buf[p].set_symbol(ch.encode_utf8(&mut b));
         }
     }
-    /// Write `s` from `(c, r)`: a wide character takes its cell and
-    /// blanks the next, as ratatui lays it; zero-width ones are dropped.
+    /// Write `s` from `(c, r)` by [`graphemes`]: a wide glyph takes its
+    /// cell and blanks the next, as ratatui lays it.
     fn text(&mut self, c: i64, r: i64, s: &str, style: Style) {
         let mut at = c;
-        for ch in s.chars() {
-            let w = char_cells(ch);
-            if w == 0 {
-                continue;
-            }
+        for (g, w) in graphemes(s) {
             // A wide glyph clipped by the right edge would spill past it.
             if w == 2 && self.at(at + 1, r).is_none() {
                 break;
             }
-            self.put(at, r, ch, style);
+            if let Some(p) = self.at(at, r) {
+                self.buf[p].set_symbol(&g).set_style(style);
+            }
             if w == 2 {
                 // Its second cell is hidden behind it — reset, as ratatui does.
                 if let Some(p) = self.at(at + 1, r) {
@@ -1522,23 +1518,29 @@ fn styled(fg: Color, bold: bool) -> Style {
 
 /// Terminal cells `ch` takes: two for wide (CJK, emoji) characters,
 /// none for zero-width ones.
-fn char_cells(ch: char) -> i64 {
-    cells(ch.encode_utf8(&mut [0u8; 4]))
+/// The grapheme clusters of `s`, each with the cells it takes — split
+/// and measured the way ratatui lays text out, so a ZWJ emoji is one
+/// two-cell glyph and a combining accent stays on its letter. Every
+/// writer and measure here goes through this, so what is measured is
+/// what gets drawn. Zero-width clusters are left out.
+fn graphemes(s: &str) -> Vec<(String, i64)> {
+    Span::raw(s)
+        .styled_graphemes(Style::default())
+        .map(|g| (g.symbol.to_string(), Span::raw(g.symbol).width() as i64))
+        .filter(|&(_, w)| w > 0)
+        .collect()
 }
 
-/// Terminal cells `s` takes.
+/// Terminal cells `s` takes, as [`graphemes`] lays it out.
 fn cells(s: &str) -> i64 {
-    Span::raw(s).width() as i64
+    graphemes(s).iter().map(|&(_, w)| w).sum()
 }
 
-/// `s` followed by `…` within `room` cells — for the last label line
-/// shown when more lines follow — cut further if it doesn't fit.
+/// `s` followed by `…` within `room` cells — the last label line shown
+/// when more lines follow, so the cut always shows — cut further when
+/// the two don't fit together.
 fn fit_more(s: &str, room: i64) -> String {
-    if cells(s) < room {
-        format!("{s}…")
-    } else {
-        fit(s, room)
-    }
+    fit(&format!("{s}…"), room)
 }
 
 /// `s` cut to `cells` terminal cells, the last one `…` when cut.
@@ -1551,12 +1553,11 @@ fn fit(s: &str, room: i64) -> String {
     }
     let mut out = String::new();
     let mut used = 0;
-    for ch in s.chars() {
-        let w = char_cells(ch);
+    for (g, w) in graphemes(s) {
         if used + w > room - 1 {
             break;
         }
-        out.push(ch);
+        out.push_str(&g);
         used += w;
     }
     out.push('…');
@@ -1740,7 +1741,7 @@ impl<'s> Geo<'s> {
             let Some((text, (x, y), _)) = &e.label else {
                 continue;
             };
-            let text = flat_label(text);
+            let text = plain_label(text);
             if text.is_empty() {
                 continue;
             }
@@ -1916,7 +1917,7 @@ fn draw_class_overlay(buf: &mut Buffer, area: Rect, cs: &ClassScene, opts: &Opts
             cv.put(c, r, ch, edge);
         }
         let inner = x1 - x0 - 1;
-        let lines: Vec<String> = nb.text.split('\n').map(flat_label).collect();
+        let lines: Vec<String> = nb.text.split('\n').map(plain_line).collect();
         if lines.len() as i64 > y1 - y0 - 1 {
             cv.text(
                 x0 + 2,
@@ -1965,7 +1966,7 @@ fn draw_class_overlay(buf: &mut Buffer, area: Rect, cs: &ClassScene, opts: &Opts
         let faded = focus.is_some() && !edge_touches(e, focus);
         let style = styled(if faded { Color::DarkGray } else { CLASS_CARD }, false);
         for (side, card) in [&rel.from_card, &rel.to_card].into_iter().enumerate() {
-            let Some(card) = card.as_deref().map(flat_label) else {
+            let Some(card) = card.as_deref().map(plain_label) else {
                 continue;
             };
             let n = cells(&card);
