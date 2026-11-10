@@ -15,5 +15,6 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
-      # shellcheck ships on ubuntu-latest; install.sh is what users pipe into bash.
-      - run: shellcheck install.sh
+      # shellcheck ships on ubuntu-latest; install.sh is what users pipe into
+      # bash, and the Herdr plugin scripts run on every install and pane open.
+      - run: shellcheck install.sh herdr/scripts/*.sh
