@@ -64,6 +64,12 @@ enum Built {
 
 /// Drag state for a graph diagram: the moving node plus its base routing,
 /// so `route_partial` re-routes only the edges the drag touches.
+///
+/// Boxes come from flowmaid's own label estimate (a proportional font),
+/// which is about a fifth narrower than one cell per character, so a
+/// long label can end in `…`. Laying out with a terminal measure needs a
+/// measure-aware `route_partial` upstream first — routing every drag in
+/// full instead redraws edges the drag never touched.
 struct GraphState {
     g: Graph,
     base: Scene,
@@ -331,7 +337,7 @@ impl App {
         let now = self
             .focus
             .and_then(|i| self.scene.nodes.get(i))
-            .map(|n| (n.id.clone(), n.label.clone()));
+            .map(|n| (n.id.clone(), render::plain_label(&n.label)));
         match (now, &self.reported) {
             (None, None) => {}
             (None, Some(_)) => self.emit(Event::Clear),
@@ -369,7 +375,7 @@ impl App {
         };
         let ev = Event::SelectNode {
             id: n.id.clone(),
-            label: n.label.clone(),
+            label: render::plain_label(&n.label),
             via,
         };
         self.emit(ev);
@@ -1074,6 +1080,190 @@ mod tests {
         let base_ac = scene.nodes[2].x - scene.nodes[0].x;
         let moved_ac = moved.nodes[2].x - moved.nodes[0].x;
         assert!((moved_ac - base_ac).abs() < 1.0, "unmoved nodes stay put");
+    }
+
+    /// The rows of a preview that hold `needle` (a label's start).
+    fn rows_with<'a>(out: &'a str, needle: &str) -> Vec<&'a str> {
+        out.lines().filter(|l| l.contains(needle)).collect()
+    }
+
+    /// Whether `line` is drawn whole, or cut with a visible `…`, in `out`.
+    fn whole_or_elided(out: &str, line: &str) -> bool {
+        if out.contains(line) {
+            return true;
+        }
+        // Cut: some leading part of it, right before the ellipsis.
+        let chars: Vec<char> = line.chars().collect();
+        (1..chars.len()).rev().any(|k| {
+            let head: String = chars[..k].iter().collect();
+            out.contains(&format!("{head}…"))
+        })
+    }
+
+    #[test]
+    fn a_label_is_never_cut_silently() {
+        // At the default scale, and squeezed far below it: every line of
+        // every label is either drawn whole or visibly elided.
+        let srcs = [
+            std::fs::read_to_string("examples/pipeline.mmd").unwrap(),
+            std::fs::read_to_string("examples.mmd").unwrap(),
+            "flowchart LR\nA[Authentication Service] --> B[Order Processing Service] --> C[Notification Service]"
+                .to_string(),
+        ];
+        // Squeezing a long chain into a few rows overlaps whole boxes —
+        // that hides labels, it doesn't cut them — so the tight size is
+        // only checked on the short chain, whose boxes stay apart.
+        for (k, src) in srcs.iter().enumerate() {
+            let sc = scene_of(src, None);
+            let sizes: &[(u16, u16)] = if k == 2 {
+                &[(400, 120), (40, 10)]
+            } else {
+                &[(400, 120)]
+            };
+            for &(cols, rows) in sizes {
+                let out = render::preview(&sc, cols, rows, &Opts::default());
+                for n in &sc.nodes {
+                    for line in n.label.split('\n').map(render::plain_line) {
+                        if line.is_empty() || out.contains(&line) {
+                            continue;
+                        }
+                        // A line not drawn at all may only be one the box
+                        // has no row for, after an elided line.
+                        let shown = whole_or_elided(&out, &line);
+                        assert!(
+                            shown || out.contains('…'),
+                            "{line:?} lost without a mark at {cols}x{rows}:\n{out}"
+                        );
+                    }
+                }
+            }
+        }
+        // And squeezed, something really is elided.
+        let sc = scene_of(&srcs[2], None);
+        let out = render::preview(&sc, 40, 10, &Opts::default());
+        assert!(out.contains('…') && !out.contains("Authentication Service"));
+    }
+
+    #[test]
+    fn a_wrapped_label_draws_every_line_its_box_has_rows_for() {
+        let src = "flowchart LR\nA[This label is long enough to wrap onto more lines] --> B[ok]";
+        let sc = scene_of(src, None);
+        let lines: Vec<String> = sc.nodes[0]
+            .label
+            .split('\n')
+            .map(render::plain_line)
+            .collect();
+        assert!(lines.len() > 1, "the engine wrapped it: {lines:?}");
+        let out = render::preview(&sc, 300, 80, &Opts::default());
+        for line in &lines {
+            assert!(whole_or_elided(&out, line), "line {line:?} missing:\n{out}");
+        }
+    }
+
+    #[test]
+    fn wide_characters_and_emoji_stay_inside_their_box() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let family = "👨\u{200d}👩\u{200d}👧";
+        let src = format!("flowchart LR\nA[表示テスト] --> B[{family} fam] --> C[Käse → 東京]");
+        let sc = scene_of(&src, None);
+        let mut term = Terminal::new(TestBackend::new(200, 30)).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            render::draw(f.buffer_mut(), area, &sc, &Opts::default());
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let sym = |x: u16, y: u16| buf[(x, y)].symbol().to_string();
+        // The ZWJ family is ONE cluster in ONE cell, not three glyphs.
+        let at = (0..30)
+            .flat_map(|y| (0..200).map(move |x| (x, y)))
+            .find(|&(x, y)| sym(x, y) == family)
+            .expect("ZWJ emoji kept whole");
+        // Its box's right border is still there, right after " fam" plus
+        // padding: the label never runs over it.
+        let row: String = (at.0..200).map(|x| sym(x, at.1)).collect();
+        let after = row.split(" fam").nth(1).expect("label continues");
+        assert!(
+            after.trim_start().starts_with('│'),
+            "border right after the label: {row:?}"
+        );
+        // CJK labels: whole, and their box's right border right after
+        // them (the left side may carry the incoming arrowhead).
+        for (label, last) in [("表示テスト", "ト"), ("Käse → 東京", "京")] {
+            let (x, y) = (0..30)
+                .flat_map(|y| (0..200).map(move |x| (x, y)))
+                .find(|&(x, y)| sym(x, y) == last)
+                .expect("label drawn");
+            let row: String = (0..200).map(|x| sym(x, y)).collect();
+            let flat: String = row.chars().filter(|c| *c != ' ').collect();
+            assert!(
+                flat.contains(&label.replace(' ', "")),
+                "{label} whole: {row:?}"
+            );
+            // x + 1 is the wide glyph's hidden half.
+            let right: String = (x + 2..200).map(|c| sym(c, y)).collect();
+            assert!(
+                right.trim_start().starts_with('│'),
+                "right border kept: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn circle_labels_sit_under_the_marker_with_every_line() {
+        let sc = scene_of(
+            "flowchart LR\nC((This is a long circle label here)) --> D[x]",
+            None,
+        );
+        let lines: Vec<String> = sc.nodes[0]
+            .label
+            .split('\n')
+            .map(render::plain_line)
+            .collect();
+        let out = render::preview(&sc, 200, 60, &Opts::default());
+        let marker = out.lines().position(|l| l.contains('●')).expect("marker");
+        let first = out
+            .lines()
+            .position(|l| l.contains(lines[0].as_str()))
+            .expect("first line drawn");
+        assert_eq!(first, marker + 1, "label right under the marker:\n{out}");
+        for line in &lines {
+            assert!(whole_or_elided(&out, line), "{line:?}:\n{out}");
+        }
+    }
+
+    #[test]
+    fn a_long_cluster_title_ends_in_an_ellipsis() {
+        let src = "flowchart LR\nsubgraph S1[Payment processing cluster title that is long]\nA --> B\nend";
+        let sc = scene_of(src, None);
+        let out = render::preview(&sc, 200, 40, &Opts::default());
+        let row = rows_with(&out, "Payment");
+        assert_eq!(row.len(), 1, "{out}");
+        assert!(
+            out.contains("Payment processing cluster title that is long") || row[0].contains('…'),
+            "title whole or elided: {}",
+            row[0]
+        );
+    }
+
+    #[test]
+    fn events_report_a_wrapped_label_on_one_line() {
+        let mut app = app_of(
+            "flowchart LR\nA[This label is long enough to wrap onto more lines] --> B",
+            "evlabel",
+        );
+        let log = with_events(&mut app, "evlabel");
+        app.focus = Some(0);
+        app.emit_focus(Via::Click);
+        // The same node re-reported after a rebuild (`c` twice) is no
+        // change: same one-line label.
+        app.rebuild();
+        app.sync_selection();
+        let lines = log_lines(&log);
+        assert_eq!(lines.len(), 1, "no spurious select: {lines:?}");
+        assert!(lines[0].contains(r#""label":"This label is long enough to wrap onto more lines""#));
+        std::fs::remove_file(&log).ok();
     }
 
     /// A unique temp path for a test file, so parallel or concurrent

@@ -5,51 +5,49 @@
 flowcli is a [ratatui](https://ratatui.rs) front-end for the flowmaid diagram engine. It exists to prove one thing: flowmaid's `scene` API is **renderer-agnostic**. The engine hands out plain geometry — node rectangles, edge polylines, cluster boxes, labels — and never assumes SVG. flowcli takes that same geometry and paints it onto a character grid. One ~350-line adapter, and the very diagrams you'd export to SVG appear as `╭─╮ │ ╰─╯` in your shell.
 
 ```text
-        ╭─────────────╮
-        │Terima order │
-        ╰─────────────╯
-               │
-               │
-      ┌────────▼─────────┐
-      │                  │
-      │   Stok cukup?    │
-      │                  │
-      └──────────────────┘
-       ╭─────╯   │
-       │         ╰─────╮
-       │               │
-┌──────▼──────┐        │
-│Reserve stok │        │
-│             │        │
-└─────────────┘        │
-       │               │
-       │               │
- ┌─────▼─────┐         │
- │Buat invoic│         │
- └───────────┘         │
-       │               │
-       │               │
-       │               │
-┌──────▼─────┐         │
-│            │         │
-│   Bayar?   │         │
-│            │         │
-└────────────┘         │
-       │ ╰─────────╮   │
-       │           │   │
-       │           │   │
-  ┌────▼────┐     ┌▼───▼─────┐
-  │ Simpan  │     │Backorder │
-  │         │     │          │
-  └─────────┘     └──────────┘
-       │
-       │
-       │
-       ▼
-       ●
-
-
-     Kirim
+           ╭─────────────╮
+           │Terima order │
+           ╰─────────────╯
+                  │
+                  │
+         ┌────────▼─────────┐
+         │                  │
+         │   Stok cukup?    │
+         │                  │
+         └──────────────────┘
+          ╭─────╯   │
+          │         ╰─────╮
+          │               │
+   ┌──────▼──────┐        │
+   │Reserve stok │        │
+   │             │        │
+   └─────────────┘        │
+          │               │
+          │               │
+    ┌─────▼─────┐         │
+    │Buat invoi…│         │
+    └───────────┘         │
+          │               │
+          │               │
+          │               │
+   ┌──────▼─────┐         │
+   │            │         │
+   │   Bayar?   │         │
+   │            │         │
+   └────────────┘         │
+          │ ╰─────────╮   │
+          │           │   │
+          │           │   │
+     ┌────▼────┐     ┌▼───▼─────┐
+     │ Simpan  │     │Backorder │
+     │         │     │          │
+     └─────────┘     └──────────┘
+          │
+          │
+          │
+          ▼
+          ●
+        Kirim
 ```
 
 *(Above: `flowcli examples.mmd --preview`. In a real terminal the boxes are true-colour — diamonds render yellow, cylinders blue, start/stop nodes green — and arrowheads point along the flow.)*
@@ -208,11 +206,13 @@ Focus mode uses each node's `SceneNode.id` ([flowmaid #13](https://github.com/go
                   ╭──────────╮────────╮───────────╮───────────╮──────────╮────────╮─────────╮
                   │          │        │           │           │          │        │         │
     ┌────┐    ┌────────┐  ┌──▼──┐  ┌──▼───┐  ┌────▼────┐  ┌───▼────┐  ┌──▼───┐  ┌─▼─┐   ┌───▼────┐   ┌─────┐
-    │Clon│    │Format c│  │Clipp│  │Unit t│  │Integrati│  │Build re│  │Packag│  │Sig│   │Upload a│   │Publi│
+    │Clo…│    │Format …│  │Clip…│  │Unit …│  │Integrat…│  │Build r…│  │Packa…│  │Si…│   │Upload …│   │Publ…│
     └────┘    └───▲────┘  └─────┘  └──────┘  └─────────┘  └────────┘  └──────┘  └───┘   └────────┘   └──▲──┘
       │           │                                                                         │           │
+      │           │                                                                         │           │
+      │           │                                                                         │           │
   ┌───▼────┐      │                                                                         │       ┌───────┐
-  │Restore │      │                                                                         │       │Smoke t│
+  │Restore…│      │                                                                         │       │Smoke …│
   └────────┘      │                                                                         │       └───▲───┘
       │           │                                                                         │           │
       ╰───────────╯                                                                         ╰───────────╯
@@ -228,13 +228,15 @@ flowmaid's `scene::scene(&graph)` returns a `Scene` of pure geometry in f64 pixe
 - **edge polylines** — routed channel `waypoints` when present, otherwise a cubic `bezier` to sample,
 - **cluster boxes** and **labels**.
 
-flowcli's `src/render.rs` maps that onto a terminal cell grid. Because terminal cells are about twice as tall as they are wide, it scales the two axes independently (`sy ≈ 2·sx`) to keep the diagram's proportions. Then:
+flowcli's `src/render.rs` maps that onto a terminal cell grid. Because terminal cells are about twice as tall as they are wide, it scales the two axes independently (`sy ≈ 2·sx`) to keep the diagram's proportions. A diagram larger than the terminal is scaled down to fit. Then:
 
 1. **Cluster boxes** are drawn first, behind everything.
 2. **Edges** are walked cell-by-cell; each step records connection bits (up/down/left/right) so a later pass can bake real junctions — `├ ┼ ┴ ╮` — instead of dumb crossings.
-3. **Node boxes** are stamped on top with `┌─┐ │ └─┘` (square) or `╭─╮ │ ╰─╯` (rounded, for stadium/circle shapes), then their labels centred inside.
+3. **Node boxes** are stamped on top with `┌─┐ │ └─┘` (square) or `╭─╮ │ ╰─╯` (rounded, for stadium/circle shapes), then every label line the box has a row for is centred inside. A line that doesn't fit its box, or the last one shown when more are left out, ends in `…`, so a cut label never passes for the whole one. Text is laid out by grapheme, so CJK characters take two cells and an emoji sequence like 👨‍👩‍👧 stays one glyph.
 4. **Arrowheads** (`▶ ◀ ▲ ▼`) land last, on the last polyline cell outside the target box, pointing at it.
 5. Custom `style` strokes/colours (`#rrggbb`) become **true-colour** cells.
+
+Labels can still end in `…` at full size. The engine sizes boxes for a proportional font, about a fifth narrower than one cell per character. Laying flowcharts out with a terminal measure needs a measure-aware partial re-route in flowmaid first, so that a drag doesn't redraw edges it never touched.
 
 That is the entire adapter. It never touches SVG, never re-implements layout — it consumes the same `Scene` the SVG backend does. That is the point: **the engine produces geometry; renderers are interchangeable.** flowmaid stays a zero-dependency library; flowcli is the ~350 lines that turn its geometry into text.
 
