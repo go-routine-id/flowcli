@@ -8,8 +8,9 @@
 //! ends. Custom `style` colours (hex) become true-colour cells.
 
 use flowmaid::class::{ClassBox, ClassRow, ClassScene};
+use flowmaid::er::{ErRow, ErScene, ErTable};
 use flowmaid::gitgraph::GitScene;
-use flowmaid::model::{FrameKind, RelKind, SeqHead, Shape};
+use flowmaid::model::{Card, FrameKind, RelKind, SeqHead, Shape};
 use flowmaid::scene::{Scene, SceneNode};
 use flowmaid::seq::{PartBox, SeqScene};
 use ratatui::buffer::Buffer;
@@ -1521,6 +1522,214 @@ fn path_cells(pts: &[(i64, i64)]) -> Vec<(i64, i64)> {
 /// Where an edge meets a box: the cell and the direction pointing in.
 type FaceEnd = ((i64, i64), u8);
 
+/// Cell geometry the class and ER overlays share: the scale, every
+/// box's cells, and every edge's cell polyline and the cells it steps
+/// through — the same walk [`draw`] lays its lines along.
+struct Geo<'s> {
+    sc: &'s Scene,
+    sx: f64,
+    sy: f64,
+    boxes: Vec<(i64, i64, i64, i64)>,
+    index: std::collections::HashMap<&'s str, usize>,
+    /// Per edge: its polyline in cells, and its first/last scene point.
+    pts: Vec<Vec<(i64, i64)>>,
+    raw_ends: Vec<Option<[(f64, f64); 2]>>,
+    paths: Vec<Vec<(i64, i64)>>,
+}
+
+impl<'s> Geo<'s> {
+    fn new(sc: &'s Scene, area: Rect, opts: &Opts) -> Self {
+        let (sx, sy) = scale(sc, area.width, area.height, opts);
+        let cx = |x: f64| (x / sx).round() as i64;
+        let cy = |y: f64| (y / sy).round() as i64;
+        let mut pts = Vec::with_capacity(sc.edges.len());
+        let mut raw_ends = Vec::with_capacity(sc.edges.len());
+        for e in &sc.edges {
+            let raw = edge_points(e);
+            raw_ends.push(raw.first().zip(raw.last()).map(|(&a, &b)| [a, b]));
+            pts.push(raw.iter().map(|&(x, y)| (cx(x), cy(y))).collect::<Vec<_>>());
+        }
+        Geo {
+            sc,
+            sx,
+            sy,
+            boxes: sc.nodes.iter().map(|n| cell_box(n, cx, cy)).collect(),
+            index: sc
+                .nodes
+                .iter()
+                .enumerate()
+                .map(|(i, n)| (n.id.as_str(), i))
+                .collect(),
+            paths: pts.iter().map(|p| path_cells(p)).collect(),
+            pts,
+            raw_ends,
+        }
+    }
+    fn cx(&self, x: f64) -> i64 {
+        (x / self.sx).round() as i64
+    }
+    fn cy(&self, y: f64) -> i64 {
+        (y / self.sy).round() as i64
+    }
+    /// On a box, border included.
+    fn in_box(&self, c: (i64, i64)) -> bool {
+        self.boxes
+            .iter()
+            .any(|&(x0, y0, x1, y1)| c.0 >= x0 && c.0 <= x1 && c.1 >= y0 && c.1 <= y1)
+    }
+    /// Off every box's interior (a border cell is fine).
+    fn outside_interiors(&self, c: (i64, i64)) -> bool {
+        self.boxes
+            .iter()
+            .all(|&(x0, y0, x1, y1)| c.0 <= x0 || c.0 >= x1 || c.1 <= y0 || c.1 >= y1)
+    }
+    /// The colour [`draw`] gave edge `e`'s line: its source node's.
+    fn line_color(&self, e: &flowmaid::scene::SceneEdge) -> Color {
+        self.index
+            .get(e.from.as_str())
+            .map(|&i| node_color(&self.sc.nodes[i]))
+            .unwrap_or(Color::Gray)
+    }
+    /// Dash the lines of the edges `dashed` picks, outside the boxes.
+    fn dash(&self, cv: &mut Canvas, dashed: impl Fn(&flowmaid::scene::SceneEdge) -> bool) {
+        for (e, path) in self.sc.edges.iter().zip(&self.paths) {
+            if !dashed(e) {
+                continue;
+            }
+            for &(c, r) in path.iter().filter(|&&c| !self.in_box(c)) {
+                match cv.symbol(c, r) {
+                    Some("─") => cv.swap(c, r, '╌'),
+                    Some("│") => cv.swap(c, r, '╎'),
+                    _ => {}
+                }
+            }
+        }
+    }
+    /// Where edge `j` meets its two boxes: the cell, the direction
+    /// pointing in, and whether that cell is on the box's face (where
+    /// [`draw`] would put an arrowhead) rather than the polyline's last
+    /// cell off every box interior.
+    fn ends(&self, j: usize) -> [Option<(FaceEnd, bool)>; 2] {
+        let (Some(e), Some(Some(raw)), Some(pts)) =
+            (self.sc.edges.get(j), self.raw_ends.get(j), self.pts.get(j))
+        else {
+            return [None, None];
+        };
+        let mut pair = [None, None];
+        for (side, id) in [&e.from, &e.to].into_iter().enumerate() {
+            let Some(&i) = self.index.get(id.as_str()) else {
+                continue;
+            };
+            let face = face_entry(
+                &self.sc.nodes[i],
+                self.boxes[i],
+                raw[side],
+                self.sx,
+                self.sy,
+            )
+            .filter(|&(cell, _)| self.outside_interiors(cell));
+            if let Some(f) = face {
+                pair[side] = Some((f, true));
+                continue;
+            }
+            let (x0, y0, x1, y1) = self.boxes[i];
+            let off = |c: &&(i64, i64)| self.outside_interiors(**c);
+            let anchor = if side == 0 {
+                pts.iter().find(off)
+            } else {
+                pts.iter().rev().find(off)
+            };
+            if let Some(&anchor) = anchor {
+                let d = step_dir(anchor, ((x0 + x1) / 2, (y0 + y1) / 2));
+                if d != 0 {
+                    pair[side] = Some(((anchor, d), false));
+                }
+            }
+        }
+        pair
+    }
+    /// A plain end on a face: the border opens into the line.
+    fn junction(&self, cv: &mut Canvas, cell: (i64, i64), dir: u8) {
+        if matches!(cv.symbol(cell.0, cell.1), Some("─" | "│")) {
+            cv.swap(cell.0, cell.1, face_junction(dir));
+        }
+    }
+    /// Write `s` at the first candidate whose cells are all blank, else
+    /// the first clear of every box; nowhere when neither is.
+    fn place(&self, cv: &mut Canvas, cands: &[(i64, i64)], s: &str, style: Style) {
+        let n = cells(s);
+        let free = |c: i64, r: i64| (0..n).all(|k| cv.blank(c + k, r));
+        let clear = |c: i64, r: i64| (0..n).all(|k| !self.in_box((c + k, r)));
+        let spot = cands
+            .iter()
+            .find(|&&(c, r)| free(c, r))
+            .or_else(|| cands.iter().find(|&&(c, r)| clear(c, r)))
+            .copied();
+        if let Some((c, r)) = spot {
+            cv.text(c, r, s, style);
+        }
+    }
+    /// Every edge label beside the line cell nearest the engine's spot:
+    /// right/left of a vertical stretch, above/below a horizontal one;
+    /// the engine's spot itself as the last resort.
+    fn labels(&self, cv: &mut Canvas, focus: Option<&str>, color: Color) {
+        for (e, path) in self.sc.edges.iter().zip(&self.paths) {
+            let Some((text, (x, y), _)) = &e.label else {
+                continue;
+            };
+            let text = flat_label(text);
+            if text.is_empty() {
+                continue;
+            }
+            let n = cells(&text);
+            let faded = focus.is_some() && !edge_touches(e, focus);
+            let style = styled(if faded { Color::DarkGray } else { color }, false);
+            let (lc, lr) = (self.cx(*x), self.cy(*y));
+            let near = path
+                .iter()
+                .filter(|&&c| !self.in_box(c))
+                .min_by_key(|&&(c, r)| (c - lc).abs() + (r - lr).abs())
+                .copied();
+            let mut cands = Vec::new();
+            if let Some((c, r)) = near {
+                let vertical = matches!(cv.symbol(c, r), Some("│" | "╎"));
+                let beside = [(c + 2, r), (c - 1 - n, r)];
+                let over = [(c - n / 2, r - 1), (c - n / 2, r + 1)];
+                if vertical {
+                    cands.extend(beside.into_iter().chain(over));
+                } else {
+                    cands.extend(over.into_iter().chain(beside));
+                }
+            }
+            cands.push((lc - n / 2, lr));
+            // Spots with a blank cell either side first, so a label
+            // never reads as part of a line it sits beside.
+            let (mut cands, tight): (Vec<_>, Vec<_>) = cands
+                .into_iter()
+                .partition(|&(c, r)| cv.blank(c - 1, r) && cv.blank(c + n, r));
+            cands.extend(tight);
+            self.place(cv, &cands, &text, style);
+        }
+    }
+}
+
+/// Where an end's `n`-cell text may go, just outside the box beside the
+/// end cell `(c, r)` entered in `dir`: left of / above the line first
+/// when `before`, else right of / below it.
+fn card_cands((c, r): (i64, i64), dir: u8, n: i64, before: bool) -> Vec<(i64, i64)> {
+    let (a, b) = match dir {
+        DN => ((c - 1 - n, r - 1), (c + 2, r - 1)),
+        UP => ((c - 1 - n, r + 1), (c + 2, r + 1)),
+        RT => ((c - n, r - 1), (c - n, r + 1)),
+        _ => ((c + 1, r - 1), (c + 1, r + 1)),
+    };
+    if before {
+        vec![a, b]
+    } else {
+        vec![b, a]
+    }
+}
+
 /// Draw a class diagram: the generic boxes and lines, then the class
 /// overlay — compartments, UML end glyphs, cardinalities, relation
 /// labels, dashed lines and notes. `opts` should come from
@@ -1536,54 +1745,19 @@ fn draw_class_overlay(buf: &mut Buffer, area: Rect, cs: &ClassScene, opts: &Opts
         return;
     }
     let sc = &cs.scene;
-    let (sx, sy) = scale(sc, area.width, area.height, opts);
-    let cx = |x: f64| (x / sx).round() as i64;
-    let cy = |y: f64| (y / sy).round() as i64;
+    let geo = Geo::new(sc, area, opts);
+    let (sx, sy) = (geo.sx, geo.sy);
+    let cx = |x: f64| geo.cx(x);
+    let cy = |y: f64| geo.cy(y);
+    let boxes = &geo.boxes;
     let mut cv = Canvas { buf, area };
-    let boxes: Vec<_> = sc.nodes.iter().map(|n| cell_box(n, cx, cy)).collect();
-    let index: std::collections::HashMap<&str, usize> = sc
-        .nodes
-        .iter()
-        .enumerate()
-        .map(|(i, n)| (n.id.as_str(), i))
-        .collect();
-    let in_box = |c: (i64, i64)| {
-        boxes
-            .iter()
-            .any(|&(x0, y0, x1, y1)| c.0 >= x0 && c.0 <= x1 && c.1 >= y0 && c.1 <= y1)
-    };
-    let outside_interiors = |c: (i64, i64)| {
-        boxes
-            .iter()
-            .all(|&(x0, y0, x1, y1)| c.0 <= x0 || c.0 >= x1 || c.1 <= y0 || c.1 >= y1)
-    };
     let focus = opts.highlight.as_deref();
     let faded_node = |i: usize| focus.is_some_and(|h| h != sc.nodes[i].id);
 
     // 1) Dashed lines: realization / dependency, and note connectors.
-    let paths: Vec<Vec<(i64, i64)>> = sc
-        .edges
-        .iter()
-        .map(|e| {
-            let pts: Vec<_> = edge_points(e)
-                .iter()
-                .map(|&(x, y)| (cx(x), cy(y)))
-                .collect();
-            path_cells(&pts)
-        })
-        .collect();
-    for (e, path) in sc.edges.iter().zip(&paths) {
-        if !matches!(e.kind, EdgeKind::Dotted | EdgeKind::DottedOpen) {
-            continue;
-        }
-        for &(c, r) in path.iter().filter(|&&c| !in_box(c)) {
-            match cv.symbol(c, r) {
-                Some("─") => cv.swap(c, r, '╌'),
-                Some("│") => cv.swap(c, r, '╎'),
-                _ => {}
-            }
-        }
-    }
+    geo.dash(&mut cv, |e| {
+        matches!(e.kind, EdgeKind::Dotted | EdgeKind::DottedOpen)
+    });
 
     // 2) Class boxes: compartments, or just the name for a lollipop.
     for (i, (b, n)) in cs.boxes.iter().zip(&sc.nodes).enumerate() {
@@ -1698,72 +1872,30 @@ fn draw_class_overlay(buf: &mut Buffer, area: Rect, cs: &ClassScene, opts: &Opts
     // remembered per end for the cardinalities.
     let mut ends: Vec<[Option<FaceEnd>; 2]> = Vec::with_capacity(sc.edges.len());
     for (j, e) in sc.edges.iter().enumerate() {
-        let raw = edge_points(e);
-        let pts: Vec<_> = raw.iter().map(|&(x, y)| (cx(x), cy(y))).collect();
         let rel = cs.rels.get(j);
         let faded = focus.is_some() && !edge_touches(e, focus);
         let line = if faded {
             Color::DarkGray
         } else {
-            index
-                .get(e.from.as_str())
-                .map(|&i| node_color(&sc.nodes[i]))
-                .unwrap_or(Color::Gray)
+            geo.line_color(e)
         };
-        let mut pair = [None, None];
-        for (side, (id, at)) in [(&e.from, raw.first()), (&e.to, raw.last())]
-            .into_iter()
-            .enumerate()
-        {
-            let Some((&i, &at)) = index.get(id.as_str()).zip(at) else {
+        let pair = geo.ends(j);
+        for (side, end) in pair.iter().enumerate() {
+            let Some(((cell, dir), on_face)) = *end else {
                 continue;
             };
-            // Where the line meets the face, as `draw` puts arrowheads;
-            // else the polyline's last cell off every box interior.
-            let face = face_entry(&sc.nodes[i], boxes[i], at, sx, sy)
-                .filter(|&(cell, _)| outside_interiors(cell));
-            let end = face.or_else(|| {
-                let (x0, y0, x1, y1) = boxes[i];
-                let off = |c: &&(i64, i64)| outside_interiors(**c);
-                let anchor = *if side == 0 {
-                    pts.iter().find(off)
-                } else {
-                    pts.iter().rev().find(off)
-                }?;
-                let d = step_dir(anchor, ((x0 + x1) / 2, (y0 + y1) / 2));
-                (d != 0).then_some((anchor, d))
-            });
-            let Some((cell, dir)) = end else {
-                continue;
-            };
-            pair[side] = Some((cell, dir));
             let kind = rel.and_then(|r| if side == 0 { r.from_kind } else { Some(r.kind) });
             match kind.and_then(|k| rel_glyph(k, dir)) {
                 Some(g) => cv.put(cell.0, cell.1, g, styled(line, !faded)),
-                // A plain end on a face: the border opens into the line.
-                None if face.is_some() && matches!(cv.symbol(cell.0, cell.1), Some("─" | "│")) => {
-                    cv.swap(cell.0, cell.1, face_junction(dir))
-                }
+                None if on_face => geo.junction(&mut cv, cell, dir),
                 None => {}
             }
         }
-        ends.push(pair);
+        ends.push(pair.map(|p| p.map(|(f, _)| f)));
     }
 
     // 5) Cardinalities beside their end, just outside the box, on the
     // side the engine put them; then relation labels beside the line.
-    let free = |cv: &Canvas, c: i64, r: i64, n: i64| (0..n).all(|k| cv.blank(c + k, r));
-    let clear_of_boxes = |c: i64, r: i64, n: i64| (0..n).all(|k| !in_box((c + k, r)));
-    let place = |cv: &mut Canvas, cands: &[(i64, i64)], s: &str, style: Style| {
-        let n = cells(s);
-        let spot = cands
-            .iter()
-            .find(|&&(c, r)| free(cv, c, r, n))
-            .or_else(|| cands.iter().find(|&&(c, r)| clear_of_boxes(c, r, n)));
-        if let Some(&(c, r)) = spot {
-            cv.text(c, r, s, style);
-        }
-    };
     let spots = flowmaid::class::card_spots(cs);
     for (j, rel) in cs.rels.iter().enumerate() {
         let e = &sc.edges[j];
@@ -1782,67 +1914,291 @@ fn draw_class_overlay(buf: &mut Buffer, area: Rect, cs: &ClassScene, opts: &Opts
                         DN | UP => x < c as f64 * sx,
                         _ => y < r as f64 * sy,
                     });
-                    let (a, b) = match dir {
-                        DN => ((c - 1 - n, r - 1), (c + 2, r - 1)),
-                        UP => ((c - 1 - n, r + 1), (c + 2, r + 1)),
-                        RT => ((c - n, r - 1), (c - n, r + 1)),
-                        _ => ((c + 1, r - 1), (c + 1, r + 1)),
-                    };
-                    if before {
-                        vec![a, b]
-                    } else {
-                        vec![b, a]
-                    }
+                    card_cands((c, r), dir, n, before)
                 }
                 None => spot
                     .map(|(x, y)| vec![(cx(x) - n / 2, cy(y))])
                     .unwrap_or_default(),
             };
-            place(&mut cv, &cands, &card, style);
+            geo.place(&mut cv, &cands, &card, style);
         }
     }
-    for (e, path) in sc.edges.iter().zip(&paths) {
-        let Some((text, (x, y), _)) = &e.label else {
-            continue;
-        };
-        let text = flat_label(text);
-        if text.is_empty() {
-            continue;
-        }
-        let n = cells(&text);
-        let faded = focus.is_some() && !edge_touches(e, focus);
-        let style = styled(
-            if faded {
-                Color::DarkGray
-            } else {
-                CLASS_REL_LABEL
-            },
-            false,
-        );
-        let (lc, lr) = (cx(*x), cy(*y));
-        let near = path
-            .iter()
-            .filter(|&&c| !in_box(c))
-            .min_by_key(|&&(c, r)| (c - lc).abs() + (r - lr).abs())
-            .copied();
-        let mut cands = Vec::new();
-        if let Some((c, r)) = near {
-            let vertical = matches!(cv.symbol(c, r), Some("│" | "╎"));
-            let beside = [(c + 2, r), (c - 1 - n, r)];
-            let over = [(c - n / 2, r - 1), (c - n / 2, r + 1)];
-            if vertical {
-                cands.extend(beside.into_iter().chain(over));
-            } else {
-                cands.extend(over.into_iter().chain(beside));
-            }
-        }
-        cands.push((lc - n / 2, lr));
-        place(&mut cv, &cands, &text, style);
-    }
+    geo.labels(&mut cv, focus, CLASS_REL_LABEL);
 }
 
 /// Headless render of a class diagram, overlay included. `opts` should
 /// come from [`class_opts`] (as the app's do).
 pub fn preview_class(cs: &ClassScene, cols: u16, rows: u16, opts: &Opts) -> String {
     render_text(cols, rows, |buf, area| draw_class(buf, area, cs, opts))
+}
+
+// ---------------------------------------------------------------------
+// ER diagrams
+// ---------------------------------------------------------------------
+
+/// Colours of the ER overlay's text. Table borders and lines keep the
+/// generic painter's colours.
+const ER_TYPE: Color = Color::Gray;
+const ER_NAME: Color = Color::White;
+const ER_KEYS: Color = Color::Yellow;
+const ER_COMMENT: Color = Color::DarkGray;
+const ER_CARD: Color = Color::LightBlue;
+const ER_REL_LABEL: Color = Color::White;
+/// Blank cells between a table's type / name / keys / comment columns.
+const ER_COL_GAP_CELLS: i64 = 2;
+
+/// One cell row of an entity table, top to bottom.
+enum ErLine<'a> {
+    Title,
+    Divider,
+    Row(&'a ErRow),
+    /// Rows cut for lack of room.
+    More,
+}
+
+/// Every line of a table: its title, then (when it has columns) a
+/// divider and one line per column.
+fn er_lines(t: &ErTable) -> Vec<ErLine<'_>> {
+    let mut out = vec![ErLine::Title];
+    if !t.rows.is_empty() {
+        out.push(ErLine::Divider);
+        out.extend(t.rows.iter().map(ErLine::Row));
+    }
+    out
+}
+
+/// The lines that fit `room` inner rows: all of them, else the title,
+/// divider and as many columns as fit before a `…` line; the title alone
+/// (with `…` under it when there is a second row) when that is all.
+fn er_lines_within(t: &ErTable, room: usize) -> Vec<ErLine<'_>> {
+    let mut lines = er_lines(t);
+    if lines.len() <= room {
+        return lines;
+    }
+    if room <= 2 {
+        lines.truncate(1);
+        if room == 2 {
+            lines.push(ErLine::More);
+        }
+        return lines;
+    }
+    lines.truncate(room - 1);
+    lines.push(ErLine::More);
+    lines
+}
+
+/// Column widths of a table, in cells (0 for a column no row uses).
+struct ErCols {
+    ty: i64,
+    name: i64,
+    keys: i64,
+    comment: i64,
+}
+
+fn er_cols(t: &ErTable) -> ErCols {
+    let widest = |f: fn(&ErRow) -> &str| t.rows.iter().map(|r| cells(f(r))).max().unwrap_or(0);
+    ErCols {
+        ty: widest(|r| &r.ty),
+        name: widest(|r| &r.name),
+        keys: widest(|r| &r.keys),
+        comment: widest(|r| &r.comment),
+    }
+}
+
+impl ErCols {
+    /// Where each column starts, from the row's first cell; keys end
+    /// (right-aligned) at `keys + self.keys`.
+    fn starts(&self) -> (i64, i64, i64) {
+        let gap = ER_COL_GAP_CELLS;
+        let name = self.ty + gap;
+        let keys = name + self.name + gap;
+        let comment = if self.keys > 0 {
+            keys + self.keys + gap
+        } else {
+            keys
+        };
+        (name, keys, comment)
+    }
+    /// A whole row's width.
+    fn width(&self) -> i64 {
+        let (_, keys, comment) = self.starts();
+        if self.comment > 0 {
+            comment + self.comment
+        } else if self.keys > 0 {
+            keys + self.keys
+        } else {
+            keys - ER_COL_GAP_CELLS
+        }
+    }
+}
+
+/// How a cardinality reads at its end of a relationship.
+fn card_text(c: Card) -> &'static str {
+    match c {
+        Card::One => "1",
+        Card::ZeroOne => "0..1",
+        Card::ZeroMany => "0..*",
+        Card::OneMany => "1..*",
+    }
+}
+
+/// Options for drawing an ER diagram. The engine sizes a table by its
+/// proportional text width and 22 px per column row, finer than a
+/// terminal cell at the default scale, so columns would be cut or not
+/// drawn at all. Picks the coarsest scale (never coarser than `base`)
+/// at which every table gives each of its lines one cell row and its
+/// widest line a padded fit. Compute once per scene and reuse it for
+/// draw and picking.
+pub fn er_opts(es: &ErScene, base: &Opts) -> Opts {
+    let (mut sx, mut sy) = (base.sx, base.sy);
+    for (t, n) in es.tables.iter().zip(&es.scene.nodes) {
+        let widest = cells(&t.title).max(er_cols(t).width());
+        if n.w > 0.0 && widest > 0 {
+            sx = sx.min(n.w / (widest as f64 + BOX_TEXT_PAD_CELLS + BOX_FRAME_CELLS));
+        }
+        if n.h > 0.0 {
+            sy = sy.min(n.h / (er_lines(t).len() as f64 + BOX_FRAME_CELLS));
+        }
+    }
+    Opts {
+        sx,
+        sy,
+        ..base.clone()
+    }
+}
+
+/// Draw an ER diagram: the generic boxes and lines, then the ER overlay
+/// — table titles and aligned columns, dashed non-identifying
+/// relationships, cardinalities at both ends and relationship labels.
+/// `opts` should come from [`er_opts`] (as the app's do).
+pub fn draw_er(buf: &mut Buffer, area: Rect, es: &ErScene, opts: &Opts) {
+    draw_lines(buf, area, &es.scene, opts, false);
+    draw_er_overlay(buf, area, es, opts);
+}
+
+fn draw_er_overlay(buf: &mut Buffer, area: Rect, es: &ErScene, opts: &Opts) {
+    use flowmaid::model::EdgeKind;
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let sc = &es.scene;
+    let geo = Geo::new(sc, area, opts);
+    let mut cv = Canvas { buf, area };
+    let focus = opts.highlight.as_deref();
+
+    // 1) Non-identifying relationships are dashed.
+    geo.dash(&mut cv, |e| matches!(e.kind, EdgeKind::Dotted));
+
+    // 2) Tables: the title, a divider, then the columns aligned.
+    for (i, (t, n)) in es.tables.iter().zip(&sc.nodes).enumerate() {
+        let Some(&(x0, y0, x1, y1)) = geo.boxes.get(i) else {
+            continue;
+        };
+        let faded = focus.is_some_and(|h| h != n.id);
+        let tint = |c: Color| if faded { Color::DarkGray } else { c };
+        let border = styled(tint(node_color(n)), !faded && focus.is_some());
+        for r in (y0 + 1)..y1 {
+            for c in (x0 + 1)..x1 {
+                cv.put(c, r, ' ', Style::default());
+            }
+        }
+        let inner = x1 - x0 - 1;
+        let lines = er_lines_within(t, (y1 - y0 - 1).max(0) as usize);
+        let centred = |cv: &mut Canvas, r: i64, s: &str, style: Style| {
+            let s = fit(s, inner);
+            cv.text(x0 + 1 + (inner - cells(&s)).max(0) / 2, r, &s, style);
+        };
+        // A lone title sits on the middle row, as `draw` puts labels.
+        let top = if lines.len() == 1 {
+            (y0 + y1) / 2
+        } else {
+            y0 + 1
+        };
+        let cols = er_cols(t);
+        let (name_at, keys_at, comment_at) = cols.starts();
+        // Text runs from one cell in to one cell short of the border.
+        let (left, limit) = (x0 + 2, x1 - 1);
+        let seg = |cv: &mut Canvas, c: i64, r: i64, s: &str, style: Style| {
+            if !s.is_empty() && c < limit {
+                cv.text(c, r, &fit(s, limit - c), style);
+            }
+        };
+        for (k, l) in lines.iter().enumerate() {
+            let r = top + k as i64;
+            match l {
+                ErLine::Title => {
+                    centred(&mut cv, r, &t.title, styled(tint(label_color(n)), !faded))
+                }
+                ErLine::Divider => {
+                    cv.put(x0, r, '├', border);
+                    for c in (x0 + 1)..x1 {
+                        cv.put(c, r, '─', border);
+                    }
+                    cv.put(x1, r, '┤', border);
+                }
+                ErLine::Row(row) => {
+                    seg(&mut cv, left, r, &row.ty, styled(tint(ER_TYPE), false));
+                    seg(
+                        &mut cv,
+                        left + name_at,
+                        r,
+                        &row.name,
+                        styled(tint(ER_NAME), false),
+                    );
+                    let keys_from = left + keys_at + cols.keys - cells(&row.keys);
+                    seg(
+                        &mut cv,
+                        keys_from,
+                        r,
+                        &row.keys,
+                        styled(tint(ER_KEYS), !faded),
+                    );
+                    let comment = styled(tint(ER_COMMENT), false).add_modifier(Modifier::ITALIC);
+                    seg(&mut cv, left + comment_at, r, &row.comment, comment);
+                }
+                ErLine::More => centred(&mut cv, r, "…", styled(tint(ER_TYPE), false)),
+            }
+        }
+    }
+
+    // 3) Each end: the border opens into the line, its cardinality
+    // beside it just outside the table; then the relationship labels.
+    for (j, e) in sc.edges.iter().enumerate() {
+        let faded = focus.is_some() && !edge_touches(e, focus);
+        let style = styled(if faded { Color::DarkGray } else { ER_CARD }, false);
+        let pair = geo.ends(j);
+        let cards = es.cards.get(j).map(|&(a, b)| [a, b]);
+        for (side, end) in pair.iter().enumerate() {
+            let Some(((cell, dir), on_face)) = *end else {
+                continue;
+            };
+            if on_face {
+                geo.junction(&mut cv, cell, dir);
+            }
+            if let Some(card) = cards.map(|c| card_text(c[side])) {
+                let n = cells(card);
+                let mut cands = card_cands(cell, dir, n, false);
+                // Beside a vertical line: spots with a blank cell either
+                // side first (each also tried one cell further from the
+                // line), so a card never reads as part of the line. Above
+                // or below a horizontal one the row itself keeps it clear.
+                if matches!(dir, DN | UP) {
+                    let away = |(c, r): (i64, i64)| (c + (c - cell.0).signum(), r);
+                    let (padded, tight): (Vec<_>, Vec<_>) = cands
+                        .iter()
+                        .flat_map(|&p| [p, away(p)])
+                        .partition(|&(c, r)| cv.blank(c - 1, r) && cv.blank(c + n, r));
+                    cands = padded.into_iter().chain(tight).collect();
+                }
+                geo.place(&mut cv, &cands, card, style);
+            }
+        }
+    }
+    geo.labels(&mut cv, focus, ER_REL_LABEL);
+}
+
+/// Headless render of an ER diagram, overlay included. `opts` should
+/// come from [`er_opts`] (as the app's do).
+pub fn preview_er(es: &ErScene, cols: u16, rows: u16, opts: &Opts) -> String {
+    render_text(cols, rows, |buf, area| draw_er(buf, area, es, opts))
 }
