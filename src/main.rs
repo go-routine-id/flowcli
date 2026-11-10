@@ -427,22 +427,28 @@ fn run(app: &mut App) -> std::io::Result<()> {
                     Span::raw(" reload"),
                 ]
             } else {
-                vec![
+                let mut keys = vec![
                     Span::styled(" q ", keycap),
                     Span::raw(" quit  "),
                     Span::styled(" Tab ", keycap),
                     Span::raw(" focus node  "),
                     Span::styled(" click ", keycap),
                     Span::raw(" pick  "),
-                    Span::styled(" drag ", keycap),
-                    Span::raw(" move node  "),
-                    Span::styled(" s ", keycap),
-                    Span::raw(" save layout  "),
-                    Span::styled(" c ", keycap),
-                    Span::raw(" compact  "),
-                    Span::styled(" r ", keycap),
-                    Span::raw(" reload"),
-                ]
+                ];
+                // Class boxes are static: no drag, no layout to save, and
+                // `build` ignores compact for them.
+                if app.class_scene.is_none() {
+                    keys.extend([
+                        Span::styled(" drag ", keycap),
+                        Span::raw(" move node  "),
+                        Span::styled(" s ", keycap),
+                        Span::raw(" save layout  "),
+                        Span::styled(" c ", keycap),
+                        Span::raw(" compact  "),
+                    ]);
+                }
+                keys.extend([Span::styled(" r ", keycap), Span::raw(" reload")]);
+                keys
             };
             let help = Paragraph::new(Line::from(keys)).style(Style::default().fg(Color::DarkGray));
             f.render_widget(help, help_row);
@@ -1056,6 +1062,56 @@ mod tests {
         assert!(dashed("classDiagram\n  A <.. B"));
         assert!(!dashed("classDiagram\n  A <|-- B"));
         assert!(!dashed("classDiagram\n  A <-- B"));
+    }
+
+    #[test]
+    fn class_dashed_plain_link_has_no_arrowhead() {
+        // `..` is dashed and undirected: no head, unlike `..>`.
+        let cs = class_of("classDiagram\n  A .. B : uses");
+        let out = class_preview(&cs, 60, 30);
+        assert!(!out.contains(['▲', '▼', '▶', '◀']), "{out}");
+        assert!(out.contains('╎') && out.contains("uses"), "{out}");
+        let cs = class_of("classDiagram\n  A ..> B");
+        assert_eq!(class_preview(&cs, 60, 30).matches('▼').count(), 1);
+    }
+
+    #[test]
+    fn class_generic_names_keep_their_parameter() {
+        // `I`/`B` type parameters are not `<i>`/`<b>` tags.
+        let cs = class_of("classDiagram\n  class Box~I~ {\n    +int x\n  }\n  class Repo~B~");
+        let out = class_preview(&cs, 60, 20);
+        assert!(out.contains("Box<I>") && out.contains("Repo<B>"), "{out}");
+    }
+
+    #[test]
+    fn class_wide_characters_fit_their_box() {
+        let cs = class_of("classDiagram\n  class A {\n    +String 名前データ\n    +int ok\n  }");
+        let out = class_preview(&cs, 60, 20);
+        assert!(out.contains("+String 名前データ"), "{out}");
+        // Every row keeps the grid's width, so the right border lines up.
+        let width = |l: &str| ratatui::text::Span::raw(l).width();
+        assert!(out.lines().all(|l| width(l) == 60), "{out}");
+        let right = |l: &str| width(&l[..l.rfind('│').unwrap()]);
+        let rows: Vec<_> = out.lines().filter(|l| l.contains('│')).map(right).collect();
+        assert!(rows.windows(2).all(|w| w[0] == w[1]), "{rows:?}\n{out}");
+    }
+
+    #[test]
+    fn class_lollipop_name_fits_its_spot() {
+        let cs = class_of("classDiagram\n  VeryLongInterfaceName ()-- foo\n  class bar");
+        let out = class_preview(&cs, 80, 20);
+        assert!(out.contains("VeryLongInterfaceName"), "{out}");
+        // A cramped area cuts the name instead of spilling it.
+        let opts = Opts {
+            sx: 40.0,
+            ..render::class_opts(&cs, &Opts::default())
+        };
+        let out = render::preview_class(&cs, 20, 10, &opts);
+        assert!(
+            out.lines()
+                .all(|l| ratatui::text::Span::raw(l).width() == 20),
+            "{out}"
+        );
     }
 
     #[test]
