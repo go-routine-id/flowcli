@@ -3,6 +3,8 @@
 //!   flowcli diagram.mmd              # interactive
 //!   flowcli diagram.mmd --preview    # print once (headless) and exit
 //!   flowcli diagram.mmd --compact 200
+//!   flowcli diagram.mmd --watch      # redraw whenever the file changes
+//!   flowcli diagram.mmd --events sel.jsonl  # log picks as JSON Lines
 //!   flowcli --version | --self-update
 //!
 //! Interactive keys: q quit · Tab/BackTab focus a node · s save the
@@ -12,9 +14,18 @@
 //! it), edge, or cluster — via the engine's `Scene::hit_test`; drag a
 //! node to move it, edges re-route live via `route_partial` (flowchart
 //! and state diagrams). Sequence diagrams are static: only q and r apply.
+//!
+//! `--watch` re-reads the file when it changes on disk (an editor or an
+//! AI agent rewriting it): nodes you dragged keep their place, and a
+//! source that no longer parses leaves the last good diagram on screen.
+//! `--events <path>` appends what you select, drag and reload to `path`
+//! (see [`events`]) so another program can follow along.
 
+mod events;
 mod render;
 mod update;
+
+use events::{Event, Sink, Via};
 
 use flowmaid::class::ClassScene;
 use flowmaid::er::ErScene;
@@ -23,7 +34,13 @@ use flowmaid::model::{Document, Graph};
 use flowmaid::scene::Scene;
 use flowmaid::seq::SeqScene;
 use render::Opts;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// How often `--watch` reads the file. A change is applied once the
+/// file reads the same on two consecutive looks, so a writer that saves
+/// in chunks isn't parsed half-way (a change shows 1–2 intervals after
+/// the save).
+const WATCH_INTERVAL: Duration = Duration::from_millis(150);
 
 /// The parsed diagram. `Graph` diagrams (flowchart/state, non-compact)
 /// keep their source graph so nodes can be dragged and re-routed live via
@@ -60,6 +77,9 @@ struct Drag {
     /// Centre-minus-grab offset in scene px, so the node tracks the cursor
     /// from where it was actually grabbed instead of snapping its centre to it.
     off: (f64, f64),
+    /// Whether the node actually moved, so a plain click (press +
+    /// release in place) doesn't report a `drag_end`.
+    moved: bool,
 }
 
 struct App {
@@ -68,6 +88,9 @@ struct App {
     compact: Option<f64>,
     focus: Option<usize>, // index into the current scene's node ids
     pick: Option<String>, // last click readout for an edge/cluster hit
+    /// A one-off message for the title bar ("saved layout → …", a failed
+    /// events write). Cleared by the next key or click; never a selection.
+    status: Option<String>,
     scene: Scene,
     ids: Vec<String>,
     graph: Option<GraphState>,   // present ⇒ draggable
@@ -81,82 +104,275 @@ struct App {
     er_scene: Option<ErScene>,   // present ⇒ ER overlay
     drag: Option<Drag>,
     err: Option<String>,
+    /// `--watch`: re-read the file every [`WATCH_INTERVAL`].
+    watch: bool,
+    /// The file's bytes as last handled (loaded, or found broken), so
+    /// `--watch` reacts to content changes — not to timestamps, which
+    /// are coarse on some filesystems and change on a mere touch.
+    seen: Vec<u8>,
+    /// Bytes that differ from `seen`, waiting one more look to prove the
+    /// writer is done.
+    pending: Option<Vec<u8>>,
+    /// When `--watch` last read the file.
+    last_poll: Option<Instant>,
+    /// A watched reload that failed to parse. Unlike `err` it keeps the
+    /// last good diagram on screen and only shows in the title bar.
+    warn: Option<String>,
+    /// `--events`: where selections, drags and reloads are appended.
+    events: Option<Sink>,
+    /// The selection last reported to `--events` (a `select`), or `None`
+    /// after a `clear` — so a reload that drops or renames the selected
+    /// node can tell the reader.
+    reported: Option<Event>,
 }
 
 impl App {
+    /// An app for `src` (read from `path`), not yet built: call
+    /// [`App::rebuild`] before drawing.
+    fn new(path: String, src: String, compact: Option<f64>) -> App {
+        App {
+            path,
+            src,
+            compact,
+            focus: None,
+            pick: None,
+            status: None,
+            scene: Scene::empty(0.0, 0.0),
+            ids: Vec::new(),
+            graph: None,
+            git_scene: None,
+            fit_opts: None,
+            seq_scene: None,
+            class_scene: None,
+            er_scene: None,
+            drag: None,
+            err: None,
+            watch: false,
+            seen: Vec::new(),
+            pending: None,
+            last_poll: None,
+            warn: None,
+            events: None,
+            reported: None,
+        }
+    }
     fn rebuild(&mut self) {
         match build(&self.src, self.compact) {
-            Ok(built) => {
-                let (scene, graph, git_scene, seq_scene, class_scene, er_scene) = match built {
-                    Built::Graph { g, scene: fresh } => {
-                        let ids: Vec<String> = fresh.nodes.iter().map(|n| n.id.clone()).collect();
-                        let base_centers: Vec<(f64, f64)> =
-                            fresh.nodes.iter().map(|n| (n.x, n.y)).collect();
-                        // Apply a saved layout sidecar over the fresh
-                        // auto-layout, then re-route the moved edges so
-                        // the diagram opens where it was last dragged.
-                        let mut centers = base_centers.clone();
-                        let scene = if load_layout(&layout_path(&self.path), &ids, &mut centers) {
-                            flowmaid::scene::route_partial(&g, &centers, &fresh, &base_centers)
-                        } else {
-                            fresh.clone()
-                        };
-                        let gs = GraphState {
-                            g: *g,
-                            base: fresh,
-                            base_centers,
-                            centers,
-                        };
-                        (scene, Some(gs), None, None, None, None)
-                    }
-                    Built::Plain(scene) => (scene, None, None, None, None, None),
-                    Built::GitGraph(gs) => (gs.scene.clone(), None, Some(gs), None, None, None),
-                    // The real scene, so classes and tables can be focused
-                    // and picked.
-                    Built::Class(cs) => (cs.scene.clone(), None, None, None, Some(cs), None),
-                    Built::Er(es) => (es.scene.clone(), None, None, None, None, Some(es)),
-                    // An empty scene of the same extent: picking and focus
-                    // find nothing, the preview size rule still applies.
-                    Built::Sequence(sq) => (
-                        Scene::empty(sq.width, sq.height),
-                        None,
-                        None,
-                        Some(sq),
-                        None,
-                        None,
-                    ),
-                };
-                self.ids = scene.nodes.iter().map(|n| n.id.clone()).collect();
-                if let Some(f) = self.focus {
-                    if f >= self.ids.len() {
-                        self.focus = None;
-                    }
-                }
-                self.scene = scene;
-                self.graph = graph;
-                self.fit_opts = git_scene
-                    .as_ref()
-                    .map(|gs| render::git_opts(gs, &Opts::default()))
-                    .or_else(|| {
-                        class_scene
-                            .as_ref()
-                            .map(|cs| render::class_opts(cs, &Opts::default()))
-                    })
-                    .or_else(|| {
-                        er_scene
-                            .as_ref()
-                            .map(|es| render::er_opts(es, &Opts::default()))
-                    });
-                self.git_scene = git_scene;
-                self.seq_scene = seq_scene;
-                self.class_scene = class_scene;
-                self.er_scene = er_scene;
-                self.drag = None;
-                self.pick = None; // indices change on rebuild
-                self.err = None;
-            }
+            Ok(built) => self.apply(built, &[]),
             Err(e) => self.err = Some(e),
         }
+    }
+    /// Install a freshly built diagram. `keep` holds node positions (by
+    /// id) to carry over from before — the nodes dragged this session, on
+    /// a watched reload — applied on top of the saved layout sidecar.
+    /// Focus follows the focused node's id, not its index.
+    fn apply(&mut self, built: Built, keep: &[(String, (f64, f64))]) {
+        let focused = self.focus.and_then(|i| self.ids.get(i)).cloned();
+        let (scene, graph, git_scene, seq_scene, class_scene, er_scene) = match built {
+            Built::Graph { g, scene: fresh } => {
+                let ids: Vec<String> = fresh.nodes.iter().map(|n| n.id.clone()).collect();
+                let base_centers: Vec<(f64, f64)> =
+                    fresh.nodes.iter().map(|n| (n.x, n.y)).collect();
+                // Apply a saved layout sidecar over the fresh
+                // auto-layout, then this session's drags, then
+                // re-route the moved edges so the diagram opens
+                // where it was last dragged.
+                let mut centers = base_centers.clone();
+                let mut moved = load_layout(&layout_path(&self.path), &ids, &mut centers);
+                for (id, c) in keep {
+                    if let Some(i) = ids.iter().position(|n| n == id) {
+                        centers[i] = *c;
+                        moved = true;
+                    }
+                }
+                let scene = if moved {
+                    flowmaid::scene::route_partial(&g, &centers, &fresh, &base_centers)
+                } else {
+                    fresh.clone()
+                };
+                let gs = GraphState {
+                    g: *g,
+                    base: fresh,
+                    base_centers,
+                    centers,
+                };
+                (scene, Some(gs), None, None, None, None)
+            }
+            Built::Plain(scene) => (scene, None, None, None, None, None),
+            Built::GitGraph(gs) => (gs.scene.clone(), None, Some(gs), None, None, None),
+            // The real scene, so classes and tables can be focused
+            // and picked.
+            Built::Class(cs) => (cs.scene.clone(), None, None, None, Some(cs), None),
+            Built::Er(es) => (es.scene.clone(), None, None, None, None, Some(es)),
+            // An empty scene of the same extent: picking and focus
+            // find nothing, the preview size rule still applies.
+            Built::Sequence(sq) => (
+                Scene::empty(sq.width, sq.height),
+                None,
+                None,
+                Some(sq),
+                None,
+                None,
+            ),
+        };
+        self.ids = scene.nodes.iter().map(|n| n.id.clone()).collect();
+        self.focus = focused.and_then(|id| self.ids.iter().position(|n| *n == id));
+        self.scene = scene;
+        self.graph = graph;
+        self.fit_opts = git_scene
+            .as_ref()
+            .map(|gs| render::git_opts(gs, &Opts::default()))
+            .or_else(|| {
+                class_scene
+                    .as_ref()
+                    .map(|cs| render::class_opts(cs, &Opts::default()))
+            })
+            .or_else(|| {
+                er_scene
+                    .as_ref()
+                    .map(|es| render::er_opts(es, &Opts::default()))
+            });
+        self.git_scene = git_scene;
+        self.seq_scene = seq_scene;
+        self.class_scene = class_scene;
+        self.er_scene = er_scene;
+        self.drag = None;
+        self.pick = None; // indices change on rebuild
+        self.err = None;
+    }
+    /// Positions of the nodes the user moved — by drag this session or
+    /// from the layout sidecar — so a watched reload can keep them.
+    fn dragged_positions(&self) -> Vec<(String, (f64, f64))> {
+        let Some(gs) = &self.graph else {
+            return Vec::new();
+        };
+        self.ids
+            .iter()
+            .zip(gs.centers.iter().zip(&gs.base_centers))
+            .filter(|(_, (c, b))| c != b)
+            .map(|(id, (c, _))| (id.clone(), *c))
+            .collect()
+    }
+    /// `--watch`: look at the file (at most once per [`WATCH_INTERVAL`])
+    /// and reload once a change has settled. Returns whether a reload
+    /// was attempted. Waits while a node is being dragged, so a reload
+    /// never cuts a drag short. A file that can't be read right now (an
+    /// editor saving by rename) is simply looked at again next time.
+    fn poll_watch(&mut self, now: Instant) -> bool {
+        if self.drag.is_some() {
+            return false;
+        }
+        if self
+            .last_poll
+            .is_some_and(|t| now.duration_since(t) < WATCH_INTERVAL)
+        {
+            return false;
+        }
+        self.last_poll = Some(now);
+        let Ok(bytes) = std::fs::read(&self.path) else {
+            return false;
+        };
+        if bytes == self.seen {
+            self.pending = None; // unchanged, or changed and changed back
+            return false;
+        }
+        if self.pending.as_ref() != Some(&bytes) {
+            self.pending = Some(bytes); // still being written? look again
+            return false;
+        }
+        self.pending = None;
+        self.seen = bytes.clone();
+        match String::from_utf8(bytes) {
+            Ok(src) => self.reload_keeping_drags(src),
+            Err(_) => self.reload_failed(None, "the file is not UTF-8 text".into()),
+        }
+        true
+    }
+    /// Swap in a new source, keeping dragged nodes where they are. A
+    /// source that fails to parse keeps the last good diagram (shown
+    /// with a warning) instead of blanking the canvas — mid-edit saves
+    /// are normal when something else is writing the file.
+    fn reload_keeping_drags(&mut self, src: String) {
+        match build(&src, self.compact) {
+            Ok(built) => {
+                let keep = self.dragged_positions();
+                self.src = src;
+                self.apply(built, &keep);
+                self.warn = None;
+                self.emit(Event::Reload { error: None });
+                self.sync_selection();
+            }
+            Err(e) => self.reload_failed(Some(src), e),
+        }
+    }
+    /// A watched reload that didn't parse (`src`, when it is text at all).
+    fn reload_failed(&mut self, src: Option<String>, e: String) {
+        if self.err.is_some() {
+            // No good diagram to keep: show the new error instead.
+            if let Some(src) = src {
+                self.src = src;
+            }
+            self.err = Some(e.clone());
+        } else {
+            self.warn = Some(e.clone());
+        }
+        self.emit(Event::Reload { error: Some(e) });
+    }
+    /// After a rebuild or reload: tell the `--events` reader if the
+    /// selection it was last told about is gone or changed. An edge or
+    /// cluster pick never survives a rebuild; a focused node does (by
+    /// id), and is re-reported when its label changed. While a parse
+    /// error hides the diagram nothing is selectable.
+    fn sync_selection(&mut self) {
+        if self.err.is_some() {
+            self.focus = None;
+            self.pick = None;
+        }
+        let now = self
+            .focus
+            .and_then(|i| self.scene.nodes.get(i))
+            .map(|n| (n.id.clone(), n.label.clone()));
+        match (now, &self.reported) {
+            (None, None) => {}
+            (None, Some(_)) => self.emit(Event::Clear),
+            (
+                Some((id, label)),
+                Some(Event::SelectNode {
+                    id: i, label: l, ..
+                }),
+            ) if id == *i && label == *l => {}
+            (Some((id, label)), _) => self.emit(Event::SelectNode {
+                id,
+                label,
+                via: Via::Reload,
+            }),
+        }
+    }
+    /// Append `ev` to the `--events` file, if any (a failed write is
+    /// reported in the title bar), and remember the current selection.
+    fn emit(&mut self, ev: Event) {
+        match &ev {
+            Event::SelectNode { .. } | Event::SelectEdge { .. } | Event::SelectCluster { .. } => {
+                self.reported = Some(ev.clone())
+            }
+            Event::Clear => self.reported = None,
+            _ => {}
+        }
+        if let Some(msg) = self.events.as_mut().and_then(|s| s.emit(&ev)) {
+            self.status = Some(msg);
+        }
+    }
+    /// Report the focused node as selected (`via` says how).
+    fn emit_focus(&mut self, via: Via) {
+        let Some(n) = self.focus.and_then(|i| self.scene.nodes.get(i)) else {
+            return;
+        };
+        let ev = Event::SelectNode {
+            id: n.id.clone(),
+            label: n.label.clone(),
+            via,
+        };
+        self.emit(ev);
     }
     /// Draw/pick options. A gitGraph gets [`render::git_opts`], a class
     /// diagram [`render::class_opts`] and an ER diagram
@@ -175,7 +391,7 @@ impl App {
     /// canonical. No-op for non-graph diagrams (nothing to drag).
     fn save_layout(&mut self) {
         let Some(gs) = &self.graph else {
-            self.pick = Some("nothing to save — drag needs a flowchart/state diagram".into());
+            self.status = Some("nothing to save — drag needs a flowchart/state diagram".into());
             return;
         };
         let mut out = String::new();
@@ -185,7 +401,7 @@ impl App {
             }
         }
         let p = layout_path(&self.path);
-        self.pick = Some(match std::fs::write(&p, out) {
+        self.status = Some(match std::fs::write(&p, out) {
             Ok(()) => format!("saved layout → {p}"),
             Err(e) => format!("save failed: {e}"),
         });
@@ -263,18 +479,28 @@ fn build(mmd: &str, compact: Option<f64>) -> Result<Built, String> {
     }
 }
 
-const USAGE: &str =
-    "usage: flowcli <file.mmd> [--preview] [--compact <px>]\n       flowcli --version | --self-update";
+const USAGE: &str = "usage: flowcli <file.mmd> [--preview] [--compact <px>] [--watch] [--events <path>]\n       flowcli --version | --self-update";
 
 fn main() {
     let mut path = None;
     let mut preview = false;
     let mut compact = None;
+    let mut watch = false;
+    let mut events_path = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--preview" => preview = true,
             "--compact" => compact = args.next().and_then(|v| v.parse().ok()),
+            "--watch" => watch = true,
+            "--events" => match args.next() {
+                // A flag right after --events means its path was left out.
+                Some(p) if !p.starts_with("--") => events_path = Some(p),
+                _ => {
+                    eprintln!("--events needs a file path\n{USAGE}");
+                    std::process::exit(2);
+                }
+            },
             "-h" | "--help" => {
                 eprintln!("{USAGE}");
                 return;
@@ -291,6 +517,11 @@ fn main() {
         eprintln!("{USAGE}");
         std::process::exit(2);
     };
+    if preview && (watch || events_path.is_some()) {
+        // --preview prints once and exits: nothing to watch or select.
+        eprintln!("--watch and --events need the interactive view, not --preview");
+        std::process::exit(2);
+    }
     let src = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) => {
@@ -299,23 +530,18 @@ fn main() {
         }
     };
 
-    let mut app = App {
-        path,
-        src,
-        compact,
-        focus: None,
-        pick: None,
-        scene: Scene::empty(0.0, 0.0),
-        ids: Vec::new(),
-        graph: None,
-        git_scene: None,
-        fit_opts: None,
-        seq_scene: None,
-        class_scene: None,
-        er_scene: None,
-        drag: None,
-        err: None,
-    };
+    let mut app = App::new(path, src, compact);
+    app.watch = watch;
+    app.seen = app.src.as_bytes().to_vec();
+    if let Some(p) = &events_path {
+        match Sink::open(p, &app.path) {
+            Ok(sink) => app.events = Some(sink),
+            Err(e) => {
+                eprintln!("cannot open events file {p}: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     app.rebuild();
 
     if preview {
@@ -352,8 +578,8 @@ fn main() {
 fn run(app: &mut App) -> std::io::Result<()> {
     use flowmaid::scene::Hit;
     use ratatui::crossterm::event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
-        MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event as Input, KeyCode, KeyEventKind,
+        MouseButton, MouseEventKind,
     };
     use ratatui::crossterm::execute;
     use ratatui::layout::{Constraint, Layout, Rect};
@@ -366,7 +592,11 @@ fn run(app: &mut App) -> std::io::Result<()> {
     // The inner canvas rect from the last frame, so a click can be mapped
     // back to scene pixels. Recomputed every draw (size may change).
     let mut canvas_area: Option<Rect> = None;
+    app.emit(Event::Open);
     let result = loop {
+        if app.watch {
+            app.poll_watch(Instant::now());
+        }
         term.draw(|f| {
             let [top, body, help_row] = Layout::vertical([
                 Constraint::Length(1),
@@ -388,15 +618,28 @@ fn run(app: &mut App) -> std::io::Result<()> {
                     app.scene.edges.len()
                 ),
             };
-            let title = Line::from(vec![
-                Span::styled(
-                    " flowcli ",
-                    Style::default().fg(Color::Black).bg(Color::Cyan),
-                ),
+            // Watch state and a failed reload go right after the badge:
+            // a long path would push anything later off a narrow terminal.
+            let mut title = vec![Span::styled(
+                if app.watch {
+                    " flowcli · watching "
+                } else {
+                    " flowcli "
+                },
+                Style::default().fg(Color::Black).bg(Color::Cyan),
+            )];
+            if let Some(w) = &app.warn {
+                // The canvas still shows the last good diagram.
+                title.push(Span::styled(
+                    format!(" reload failed, showing last good: {w} "),
+                    Style::default().fg(Color::Red),
+                ));
+            }
+            title.extend([
                 Span::raw(format!(" {} ", app.path)),
                 Span::styled(
                     format!(
-                        "· {counts}{}{}{} ",
+                        "· {counts}{}{}{}{} ",
                         if app.compact.is_some() && app.seq_scene.is_none() {
                             " · compact"
                         } else {
@@ -407,11 +650,15 @@ fn run(app: &mut App) -> std::io::Result<()> {
                             .as_deref()
                             .map(|p| format!(" · picked: {p}"))
                             .unwrap_or_default(),
+                        app.status
+                            .as_deref()
+                            .map(|m| format!(" · {m}"))
+                            .unwrap_or_default(),
                     ),
                     Style::default().fg(Color::DarkGray),
                 ),
             ]);
-            f.render_widget(Paragraph::new(title), top);
+            f.render_widget(Paragraph::new(Line::from(title)), top);
 
             let canvas = Block::default()
                 .borders(Borders::ALL)
@@ -477,10 +724,16 @@ fn run(app: &mut App) -> std::io::Result<()> {
 
         if event::poll(Duration::from_millis(150))? {
             match event::read()? {
-                Event::Mouse(m) => {
+                Input::Mouse(m) => {
                     let Some(area) = canvas_area else { continue };
+                    if app.err.is_some() {
+                        // A parse error hides the diagram: the scene
+                        // behind it is stale, so nothing can be picked.
+                        continue;
+                    }
                     match m.kind {
                         MouseEventKind::Down(MouseButton::Left) => {
+                            app.status = None;
                             match render::pick(&app.scene, area, m.column, m.row, &app.opts()) {
                                 // A node pick drives the existing focus/dim
                                 // highlight AND grabs the node for dragging
@@ -488,6 +741,7 @@ fn run(app: &mut App) -> std::io::Result<()> {
                                 Some(Hit::Node(i)) => {
                                     app.focus = Some(i);
                                     app.pick = None;
+                                    app.emit_focus(Via::Click);
                                     if app.graph.is_some() {
                                         let off = app
                                             .graph
@@ -502,7 +756,11 @@ fn run(app: &mut App) -> std::io::Result<()> {
                                             ))
                                             .map(|(c, p)| (c.0 - p.0, c.1 - p.1))
                                             .unwrap_or((0.0, 0.0));
-                                        app.drag = Some(Drag { node: i, off });
+                                        app.drag = Some(Drag {
+                                            node: i,
+                                            off,
+                                            moved: false,
+                                        });
                                     }
                                 }
                                 Some(Hit::Edge(i)) => {
@@ -511,6 +769,14 @@ fn run(app: &mut App) -> std::io::Result<()> {
                                         .edges
                                         .get(i)
                                         .map(|e| format!("edge {}→{}", e.from, e.to));
+                                    if let Some(e) = app.scene.edges.get(i) {
+                                        let ev = Event::SelectEdge {
+                                            from: e.from.clone(),
+                                            to: e.to.clone(),
+                                            label: e.label.as_ref().map(|l| l.0.clone()),
+                                        };
+                                        app.emit(ev);
+                                    }
                                 }
                                 Some(Hit::Cluster(i)) => {
                                     app.pick = app.scene.clusters.get(i).map(|c| {
@@ -521,11 +787,22 @@ fn run(app: &mut App) -> std::io::Result<()> {
                                         };
                                         format!("cluster {name}")
                                     });
+                                    if let Some(c) = app.scene.clusters.get(i) {
+                                        let ev = Event::SelectCluster {
+                                            id: c.id.clone(),
+                                            title: c.title.clone(),
+                                        };
+                                        app.emit(ev);
+                                    }
                                 }
                                 // Click on empty space clears the selection.
                                 None => {
+                                    let had = app.focus.is_some() || app.pick.is_some();
                                     app.focus = None;
                                     app.pick = None;
+                                    if had {
+                                        app.emit(Event::Clear);
+                                    }
                                 }
                             }
                         }
@@ -537,26 +814,45 @@ fn run(app: &mut App) -> std::io::Result<()> {
                                     render::to_scene(&app.scene, area, m.column, m.row, &app.opts())
                                 {
                                     app.drag_node(d.0, x, y, d.1);
+                                    if let Some(d) = &mut app.drag {
+                                        d.moved = true;
+                                    }
                                 }
                             }
                         }
-                        MouseEventKind::Up(MouseButton::Left) => app.drag = None,
+                        MouseEventKind::Up(MouseButton::Left) => {
+                            if let Some(d) = app.drag.take().filter(|d| d.moved) {
+                                let at = app.graph.as_ref().and_then(|gs| gs.centers.get(d.node));
+                                if let (Some(id), Some(&(x, y))) = (app.ids.get(d.node), at) {
+                                    let ev = Event::DragEnd {
+                                        id: id.clone(),
+                                        x,
+                                        y,
+                                    };
+                                    app.emit(ev);
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
-                Event::Key(k) => {
+                Input::Key(k) => {
                     if k.kind != KeyEventKind::Press {
                         continue;
                     }
+                    app.status = None;
                     match k.code {
                         KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
-                        KeyCode::Tab | KeyCode::Right | KeyCode::Down => {
+                        // Focus needs a drawn diagram (see the mouse arm).
+                        KeyCode::Tab | KeyCode::Right | KeyCode::Down if app.err.is_none() => {
                             app.focus = cycle(app.focus, app.ids.len(), 1);
                             app.pick = None;
+                            app.emit_focus(Via::Key);
                         }
-                        KeyCode::BackTab | KeyCode::Left | KeyCode::Up => {
+                        KeyCode::BackTab | KeyCode::Left | KeyCode::Up if app.err.is_none() => {
                             app.focus = cycle(app.focus, app.ids.len(), -1);
                             app.pick = None;
+                            app.emit_focus(Via::Key);
                         }
                         KeyCode::Char('c') => {
                             app.compact = if app.compact.is_some() {
@@ -565,13 +861,28 @@ fn run(app: &mut App) -> std::io::Result<()> {
                                 Some(220.0)
                             };
                             app.rebuild();
+                            app.sync_selection();
                         }
                         KeyCode::Char('s') => app.save_layout(),
+                        // Reload from disk, dropping unsaved drags (the
+                        // saved sidecar still applies).
                         KeyCode::Char('r') => {
-                            if let Ok(s) = std::fs::read_to_string(&app.path) {
-                                app.src = s;
+                            if let Ok(bytes) = std::fs::read(&app.path) {
+                                if let Ok(s) = String::from_utf8(bytes.clone()) {
+                                    app.src = s;
+                                }
+                                app.seen = bytes; // --watch: already handled
+                                app.pending = None;
                             }
                             app.rebuild();
+                            // Just read from disk: either it drew, or its
+                            // error now fills the canvas — no stale warning.
+                            app.warn = None;
+                            let ev = Event::Reload {
+                                error: app.err.clone(),
+                            };
+                            app.emit(ev);
+                            app.sync_selection();
                         }
                         _ => {}
                     }
@@ -580,6 +891,9 @@ fn run(app: &mut App) -> std::io::Result<()> {
             }
         }
     };
+    // Also when the loop ended on a terminal error, so a follower of
+    // --events never thinks a dead session is still open.
+    app.emit(Event::Quit);
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
@@ -760,6 +1074,250 @@ mod tests {
         let base_ac = scene.nodes[2].x - scene.nodes[0].x;
         let moved_ac = moved.nodes[2].x - moved.nodes[0].x;
         assert!((moved_ac - base_ac).abs() < 1.0, "unmoved nodes stay put");
+    }
+
+    /// A unique temp path for a test file, so parallel or concurrent
+    /// test runs never share one.
+    fn temp(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("flowcli_test_{}_{name}", std::process::id()))
+    }
+
+    /// A built app for `src`, its path in the temp dir where no layout
+    /// sidecar exists (so only this session's drags move nodes).
+    fn app_of(src: &str, name: &str) -> App {
+        let path = temp(&format!("{name}.mmd"));
+        let mut app = App::new(path.to_string_lossy().into_owned(), src.into(), None);
+        app.rebuild();
+        assert!(app.err.is_none(), "test source must parse");
+        app
+    }
+
+    /// `app` with an `--events` sink; returns the log's path.
+    fn with_events(app: &mut App, name: &str) -> std::path::PathBuf {
+        let log = temp(&format!("{name}.jsonl"));
+        std::fs::remove_file(&log).ok();
+        app.events = Some(Sink::open(log.to_str().unwrap(), &app.path).unwrap());
+        log
+    }
+
+    fn log_lines(log: &std::path::Path) -> Vec<String> {
+        let text = std::fs::read_to_string(log).unwrap_or_default();
+        text.lines().map(str::to_string).collect()
+    }
+
+    fn center_of(app: &App, id: &str) -> (f64, f64) {
+        let i = app.ids.iter().position(|n| n == id).expect("node exists");
+        app.graph.as_ref().expect("draggable").centers[i]
+    }
+
+    #[test]
+    fn watched_reload_keeps_dragged_nodes_and_focus() {
+        let mut app = app_of("flowchart TD\nA --> B --> C", "keep");
+        let b = app.ids.iter().position(|n| n == "B").unwrap();
+        let (x, y) = center_of(&app, "B");
+        app.drag_node(b, x + 200.0, y, (0.0, 0.0));
+        app.focus = Some(b);
+        let dragged = center_of(&app, "B");
+        let a_before = center_of(&app, "A");
+        // A new node in front shifts every index; B must keep its dragged
+        // spot and the focus must follow B by id.
+        app.reload_keeping_drags("flowchart TD\nX --> A --> B --> C".into());
+        assert!(app.err.is_none() && app.warn.is_none());
+        assert_eq!(app.ids.len(), 4);
+        assert_eq!(center_of(&app, "B"), dragged, "dragged node stays put");
+        assert_eq!(
+            app.focus.and_then(|i| app.ids.get(i)).map(String::as_str),
+            Some("B")
+        );
+        // An undragged node is NOT pinned: it follows the new auto-layout.
+        let fresh = scene_of("flowchart TD\nX --> A --> B --> C", None);
+        let a_fresh = fresh.nodes.iter().find(|n| n.id == "A").map(|n| (n.x, n.y));
+        assert_eq!(Some(center_of(&app, "A")), a_fresh);
+        assert_ne!(center_of(&app, "A"), a_before, "layout moved A down");
+    }
+
+    #[test]
+    fn watched_reload_of_a_broken_source_keeps_the_last_good_diagram() {
+        let bad = "this is not a diagram";
+        assert!(build(bad, None).is_err(), "precondition: unparseable");
+        let mut app = app_of("flowchart LR\nA --> B --> C", "broken");
+        let log = with_events(&mut app, "broken");
+        app.reload_keeping_drags(bad.into());
+        // Still drawable: no full-screen error, the old nodes remain and
+        // the source stays the last good one.
+        assert!(app.err.is_none(), "canvas keeps the last good diagram");
+        assert!(app.warn.is_some(), "failure shows in the title bar");
+        assert_eq!(app.ids, ["A", "B", "C"]);
+        assert!(app.src.starts_with("flowchart"));
+        // A rebuild of that last good source (the `c` key) must not hide
+        // the fact that the file on disk is still broken.
+        app.rebuild();
+        assert!(app.warn.is_some(), "warning survives a compact toggle");
+        // Fixing the file clears the warning.
+        app.reload_keeping_drags("flowchart LR\nA --> B".into());
+        assert!(app.warn.is_none());
+        assert_eq!(app.ids, ["A", "B"]);
+        let lines = log_lines(&log);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains(r#""event":"reload""#) && lines[0].contains(r#""ok":false"#));
+        assert!(lines[1].contains(r#""ok":true"#));
+        std::fs::remove_file(&log).ok();
+    }
+
+    #[test]
+    fn watched_reload_with_no_good_diagram_shows_the_new_error() {
+        let path = temp("nogood.mmd").to_string_lossy().into_owned();
+        let mut app = App::new(path, "still not a diagram".into(), None);
+        app.rebuild();
+        assert!(app.err.is_some());
+        app.reload_keeping_drags("nor is this".into());
+        assert!(app.err.is_some() && app.warn.is_none());
+        app.reload_keeping_drags("flowchart LR\nA --> B".into());
+        assert!(app.err.is_none(), "a fixed file draws again");
+    }
+
+    #[test]
+    fn poll_watch_reloads_a_settled_change_only() {
+        let path = temp("watch.mmd");
+        let p = path.to_string_lossy().into_owned();
+        std::fs::write(&path, "flowchart LR\nA --> B").unwrap();
+        let mut app = App::new(p, std::fs::read_to_string(&path).unwrap(), None);
+        app.seen = app.src.as_bytes().to_vec();
+        app.rebuild();
+        let t0 = Instant::now();
+        let tick = |n: u32| t0 + WATCH_INTERVAL * n;
+        assert!(!app.poll_watch(tick(0)), "unchanged file: nothing to do");
+        // Same length, so neither size nor a coarse mtime would tell.
+        std::fs::write(&path, "flowchart LR\nA --> C").unwrap();
+        assert!(!app.poll_watch(tick(0)), "too soon after the last look");
+        assert!(!app.poll_watch(tick(1)), "first sighting: wait one look");
+        assert!(app.poll_watch(tick(2)), "settled: reload");
+        assert_eq!(app.ids, ["A", "C"]);
+        assert!(!app.poll_watch(tick(3)), "already handled");
+        // A write that is still changing is never parsed half-way.
+        std::fs::write(&path, "flowchart LR\nA --> C -").unwrap();
+        assert!(!app.poll_watch(tick(4)));
+        std::fs::write(&path, "flowchart LR\nA --> C --> D").unwrap();
+        assert!(!app.poll_watch(tick(5)), "changed again: wait again");
+        assert!(app.poll_watch(tick(6)));
+        assert_eq!(app.ids, ["A", "C", "D"]);
+        assert!(app.warn.is_none(), "the half-written state never loaded");
+        // A file briefly gone (save-by-rename) is no error, just no reload.
+        std::fs::remove_file(&path).unwrap();
+        assert!(!app.poll_watch(tick(7)));
+        assert!(!app.poll_watch(tick(8)));
+        assert_eq!(app.ids, ["A", "C", "D"]);
+    }
+
+    #[test]
+    fn poll_watch_waits_for_a_drag_to_finish() {
+        let path = temp("dragwait.mmd");
+        let p = path.to_string_lossy().into_owned();
+        std::fs::write(&path, "flowchart LR\nA --> B").unwrap();
+        let mut app = App::new(p, std::fs::read_to_string(&path).unwrap(), None);
+        app.seen = app.src.as_bytes().to_vec();
+        app.rebuild();
+        std::fs::write(&path, "flowchart LR\nA --> B --> C").unwrap();
+        app.drag = Some(Drag {
+            node: 0,
+            off: (0.0, 0.0),
+            moved: true,
+        });
+        let t0 = Instant::now();
+        for n in 0..4 {
+            assert!(
+                !app.poll_watch(t0 + WATCH_INTERVAL * n),
+                "no reload mid-drag"
+            );
+        }
+        assert!(app.drag.is_some(), "the drag is not cut short");
+        app.drag = None; // mouse released
+        assert!(!app.poll_watch(t0 + WATCH_INTERVAL * 5));
+        assert!(app.poll_watch(t0 + WATCH_INTERVAL * 6));
+        assert_eq!(app.ids.len(), 3);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn non_utf8_file_warns_instead_of_being_ignored() {
+        let path = temp("binary.mmd");
+        let p = path.to_string_lossy().into_owned();
+        std::fs::write(&path, "flowchart LR\nA --> B").unwrap();
+        let mut app = App::new(p, std::fs::read_to_string(&path).unwrap(), None);
+        app.seen = app.src.as_bytes().to_vec();
+        app.rebuild();
+        std::fs::write(&path, [0xff, 0xfe, 0x00]).unwrap();
+        let t0 = Instant::now();
+        assert!(!app.poll_watch(t0));
+        assert!(app.poll_watch(t0 + WATCH_INTERVAL));
+        assert!(app.warn.as_deref().is_some_and(|w| w.contains("UTF-8")));
+        assert_eq!(app.ids, ["A", "B"], "last good diagram kept");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn reload_tells_the_events_reader_when_the_selection_changes() {
+        let mut app = app_of("flowchart LR\nA[Alpha] --> B[Beta]", "sel");
+        let log = with_events(&mut app, "sel");
+        app.focus = app.ids.iter().position(|n| n == "B");
+        app.emit_focus(Via::Click);
+        // Unchanged node: nothing new to say.
+        app.reload_keeping_drags("flowchart LR\nA[Alpha] --> B[Beta]\n".into());
+        // Same id, new label: re-reported.
+        app.reload_keeping_drags("flowchart LR\nA[Alpha] --> B[Bravo]".into());
+        // Gone: cleared.
+        app.reload_keeping_drags("flowchart LR\nA[Alpha]".into());
+        let lines = log_lines(&log);
+        let kinds: Vec<&str> = lines
+            .iter()
+            .map(|l| {
+                if l.contains(r#""via":"reload""#) {
+                    "select-reload"
+                } else if l.contains(r#""event":"select""#) {
+                    "select"
+                } else if l.contains(r#""event":"clear""#) {
+                    "clear"
+                } else {
+                    "reload"
+                }
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "select",
+                "reload",
+                "reload",
+                "select-reload",
+                "reload",
+                "clear"
+            ]
+        );
+        assert!(lines[3].contains(r#""label":"Bravo""#));
+        std::fs::remove_file(&log).ok();
+    }
+
+    #[test]
+    fn a_parse_error_drops_the_selection() {
+        let mut app = App::new(
+            temp("errsel.mmd").to_string_lossy().into_owned(),
+            "flowchart LR\nA --> B".into(),
+            None,
+        );
+        app.rebuild();
+        let log = with_events(&mut app, "errsel");
+        app.focus = Some(0);
+        app.emit_focus(Via::Key);
+        // What `r` does with a broken file: a full-screen error, behind
+        // which nothing can stay selected.
+        app.src = "this is not a diagram".into();
+        assert!(build(&app.src, None).is_err(), "precondition: unparseable");
+        app.rebuild();
+        app.sync_selection();
+        assert!(app.err.is_some() && app.focus.is_none());
+        let lines = log_lines(&log);
+        assert!(lines.last().unwrap().contains(r#""event":"clear""#));
+        std::fs::remove_file(&log).ok();
     }
 
     #[test]
