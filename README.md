@@ -5,35 +5,51 @@
 flowcli is a [ratatui](https://ratatui.rs) front-end for the flowmaid diagram engine. It exists to prove one thing: flowmaid's `scene` API is **renderer-agnostic**. The engine hands out plain geometry — node rectangles, edge polylines, cluster boxes, labels — and never assumes SVG. flowcli takes that same geometry and paints it onto a character grid. One ~350-line adapter, and the very diagrams you'd export to SVG appear as `╭─╮ │ ╰─╯` in your shell.
 
 ```text
-           ╭─────────────╮
-           │Terima order │
-           ╰─────────────╯
-                  │
-         ┌────────▼─────────┐
-         │   Stok cukup?    │
-         └──────────────────┘
-               ╭╯      ╰╮
-             ╭─╯        ╰╮
-   ┌─────────◀───┐       ╰╮
-   │Reserve stok │        │
-   └─────────────┘        │
-          │               │
-    ┌─────▼─────┐         │
-    │Buat invoic│         │
-    └───────────┘         │
-          │               │
-   ┌──────◀─────┐         │
-   │   Bayar?   │         │
-   └────────────┘         │
-          │     ╰────╮    │
-     ┌────▼────┐     ╰╮   │
-     │ Simpan  │     ┌▶───▼─────┐
-     │         │     │Backorder │
-     └─────────┘     └──────────┘
-          │
-       ╭──▼──╮
-       │Kirim│
-       ╰─────╯
+        ╭─────────────╮
+        │Terima order │
+        ╰─────────────╯
+               │
+               │
+      ┌────────▼─────────┐
+      │                  │
+      │   Stok cukup?    │
+      │                  │
+      └──────────────────┘
+       ╭─────╯   │
+       │         ╰─────╮
+       │               │
+┌──────▼──────┐        │
+│Reserve stok │        │
+│             │        │
+└─────────────┘        │
+       │               │
+       │               │
+ ┌─────▼─────┐         │
+ │Buat invoic│         │
+ └───────────┘         │
+       │               │
+       │               │
+       │               │
+┌──────▼─────┐         │
+│            │         │
+│   Bayar?   │         │
+│            │         │
+└────────────┘         │
+       │ ╰─────────╮   │
+       │           │   │
+       │           │   │
+  ┌────▼────┐     ┌▼───▼─────┐
+  │ Simpan  │     │Backorder │
+  │         │     │          │
+  └─────────┘     └──────────┘
+       │
+       │
+       │
+       ▼
+       ●
+
+
+     Kirim
 ```
 
 *(Above: `flowcli examples.mmd --preview`. In a real terminal the boxes are true-colour — diamonds render yellow, cylinders blue, start/stop nodes green — and arrowheads point along the flow.)*
