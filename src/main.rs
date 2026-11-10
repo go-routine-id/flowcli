@@ -11,7 +11,7 @@
 //! Mouse: left-click picks whatever is under the cursor — node (focus
 //! it), edge, or cluster — via the engine's `Scene::hit_test`; drag a
 //! node to move it, edges re-route live via `route_partial` (flowchart
-//! and state diagrams).
+//! and state diagrams). Sequence diagrams are static: only q and r apply.
 
 mod render;
 mod update;
@@ -19,6 +19,7 @@ mod update;
 use flowmaid::gitgraph::GitScene;
 use flowmaid::model::{Document, Graph};
 use flowmaid::scene::Scene;
+use flowmaid::seq::SeqScene;
 use render::Opts;
 use std::time::Duration;
 
@@ -26,9 +27,14 @@ use std::time::Duration;
 /// keep their source graph so nodes can be dragged and re-routed live via
 /// `route_partial`; everything else is a static `Plain` scene.
 enum Built {
-    Graph { g: Box<Graph>, scene: Scene },
+    Graph {
+        g: Box<Graph>,
+        scene: Scene,
+    },
     Plain(Scene),
     GitGraph(GitScene),
+    /// A sequence diagram: its own geometry, nothing to pick or drag.
+    Sequence(SeqScene),
 }
 
 /// Drag state for a graph diagram: the moving node plus its base routing,
@@ -60,6 +66,7 @@ struct App {
     git_scene: Option<GitScene>, // present ⇒ gitGraph label overlay
     /// [`render::git_opts`] for `git_scene`, computed once per rebuild.
     git_opts: Option<Opts>,
+    seq_scene: Option<SeqScene>, // present ⇒ drawn by the sequence painter
     drag: Option<Drag>,
     err: Option<String>,
 }
@@ -68,7 +75,7 @@ impl App {
     fn rebuild(&mut self) {
         match build(&self.src, self.compact) {
             Ok(built) => {
-                let (scene, graph, git_scene) = match built {
+                let (scene, graph, git_scene, seq_scene) = match built {
                     Built::Graph { g, scene: fresh } => {
                         let ids: Vec<String> = fresh.nodes.iter().map(|n| n.id.clone()).collect();
                         let base_centers: Vec<(f64, f64)> =
@@ -88,10 +95,15 @@ impl App {
                             base_centers,
                             centers,
                         };
-                        (scene, Some(gs), None)
+                        (scene, Some(gs), None, None)
                     }
-                    Built::Plain(scene) => (scene, None, None),
-                    Built::GitGraph(gs) => (gs.scene.clone(), None, Some(gs)),
+                    Built::Plain(scene) => (scene, None, None, None),
+                    Built::GitGraph(gs) => (gs.scene.clone(), None, Some(gs), None),
+                    // An empty scene of the same extent: picking and focus
+                    // find nothing, the preview size rule still applies.
+                    Built::Sequence(sq) => {
+                        (Scene::empty(sq.width, sq.height), None, None, Some(sq))
+                    }
                 };
                 self.ids = scene.nodes.iter().map(|n| n.id.clone()).collect();
                 if let Some(f) = self.focus {
@@ -105,6 +117,7 @@ impl App {
                     .as_ref()
                     .map(|gs| render::git_opts(gs, &Opts::default()));
                 self.git_scene = git_scene;
+                self.seq_scene = seq_scene;
                 self.drag = None;
                 self.pick = None; // indices change on rebuild
                 self.err = None;
@@ -208,8 +221,9 @@ fn build(mmd: &str, compact: Option<f64>) -> Result<Built, String> {
         Document::Class(d) => Ok(Built::Plain(flowmaid::class::scene(&d).scene)),
         Document::GitGraph(d) => Ok(Built::GitGraph(flowmaid::gitgraph::scene(&d))),
         Document::Architecture(d) => Ok(Built::Plain(flowmaid::architecture::scene(&d).scene)),
+        Document::Sequence(d) => Ok(Built::Sequence(flowmaid::seq::scene(&d))),
         _ => Err("this diagram type isn't drawable in the terminal yet \
-                  (flowchart, state, ER, class, gitGraph, and architecture are)"
+                  (flowchart, state, ER, class, gitGraph, architecture, and sequence are)"
             .into()),
     }
 }
@@ -261,6 +275,7 @@ fn main() {
         graph: None,
         git_scene: None,
         git_opts: None,
+        seq_scene: None,
         drag: None,
         err: None,
     };
@@ -277,7 +292,9 @@ fn main() {
         } else {
             (110, 34)
         };
-        let out = if let Some(gs) = &app.git_scene {
+        let out = if let Some(sq) = &app.seq_scene {
+            render::preview_seq(sq, cols, rows, &app.opts())
+        } else if let Some(gs) = &app.git_scene {
             render::preview_with_git(gs, cols, rows, &app.opts())
         } else {
             render::preview(&app.scene, cols, rows, &app.opts())
@@ -318,6 +335,18 @@ fn run(app: &mut App) -> std::io::Result<()> {
             .areas(f.area());
 
             let focus = app.focus.and_then(|i| app.ids.get(i)).cloned();
+            let counts = match &app.seq_scene {
+                Some(sq) => format!(
+                    "{} participants · {} messages",
+                    sq.boxes.len(),
+                    sq.messages.len()
+                ),
+                None => format!(
+                    "{} nodes · {} edges",
+                    app.scene.nodes.len(),
+                    app.scene.edges.len()
+                ),
+            };
             let title = Line::from(vec![
                 Span::styled(
                     " flowcli ",
@@ -326,10 +355,8 @@ fn run(app: &mut App) -> std::io::Result<()> {
                 Span::raw(format!(" {} ", app.path)),
                 Span::styled(
                     format!(
-                        "· {} nodes · {} edges{}{}{} ",
-                        app.scene.nodes.len(),
-                        app.scene.edges.len(),
-                        if app.compact.is_some() {
+                        "· {counts}{}{}{} ",
+                        if app.compact.is_some() && app.seq_scene.is_none() {
                             " · compact"
                         } else {
                             ""
@@ -357,6 +384,8 @@ fn run(app: &mut App) -> std::io::Result<()> {
                         .style(Style::default().fg(Color::Red)),
                     inner,
                 );
+            } else if let Some(sq) = &app.seq_scene {
+                render::draw_seq(f.buffer_mut(), inner, sq, &app.opts());
             } else {
                 render::draw(f.buffer_mut(), inner, &app.scene, &app.opts());
                 if let Some(gs) = &app.git_scene {
@@ -365,23 +394,33 @@ fn run(app: &mut App) -> std::io::Result<()> {
             }
 
             let keycap = Style::default().add_modifier(Modifier::REVERSED);
-            let help = Paragraph::new(Line::from(vec![
-                Span::styled(" q ", keycap),
-                Span::raw(" quit  "),
-                Span::styled(" Tab ", keycap),
-                Span::raw(" focus node  "),
-                Span::styled(" click ", keycap),
-                Span::raw(" pick  "),
-                Span::styled(" drag ", keycap),
-                Span::raw(" move node  "),
-                Span::styled(" s ", keycap),
-                Span::raw(" save layout  "),
-                Span::styled(" c ", keycap),
-                Span::raw(" compact  "),
-                Span::styled(" r ", keycap),
-                Span::raw(" reload"),
-            ]))
-            .style(Style::default().fg(Color::DarkGray));
+            let keys = if app.seq_scene.is_some() {
+                // Static diagram: nothing to focus, pick, drag or fold.
+                vec![
+                    Span::styled(" q ", keycap),
+                    Span::raw(" quit  "),
+                    Span::styled(" r ", keycap),
+                    Span::raw(" reload"),
+                ]
+            } else {
+                vec![
+                    Span::styled(" q ", keycap),
+                    Span::raw(" quit  "),
+                    Span::styled(" Tab ", keycap),
+                    Span::raw(" focus node  "),
+                    Span::styled(" click ", keycap),
+                    Span::raw(" pick  "),
+                    Span::styled(" drag ", keycap),
+                    Span::raw(" move node  "),
+                    Span::styled(" s ", keycap),
+                    Span::raw(" save layout  "),
+                    Span::styled(" c ", keycap),
+                    Span::raw(" compact  "),
+                    Span::styled(" r ", keycap),
+                    Span::raw(" reload"),
+                ]
+            };
+            let help = Paragraph::new(Line::from(keys)).style(Style::default().fg(Color::DarkGray));
             f.render_widget(help, help_row);
         })?;
 
@@ -544,6 +583,7 @@ mod tests {
         match build(mmd, compact).unwrap() {
             Built::Graph { scene, .. } | Built::Plain(scene) => scene,
             Built::GitGraph(gs) => gs.scene,
+            Built::Sequence(sq) => Scene::empty(sq.width, sq.height),
         }
     }
 
@@ -843,5 +883,77 @@ mod tests {
             out.lines().any(|l| l.contains('▲') && l.contains('╰')),
             "retry should enter Idle's bottom face as ▲:\n{out}"
         );
+    }
+
+    /// The sequence scene of a source, failing the test for any other type.
+    fn seq_of(mmd: &str) -> SeqScene {
+        match build(mmd, None).unwrap() {
+            Built::Sequence(sq) => sq,
+            _ => panic!("not built as a sequence diagram"),
+        }
+    }
+
+    #[test]
+    fn sequence_example_draws_participants_top_and_bottom() {
+        let sq = seq_of(include_str!("../examples/sequence.mmd"));
+        let out = render::preview_seq(&sq, 110, 34, &Opts::default());
+        for name in ["User", "Web", "API", "DB"] {
+            assert!(
+                out.matches(name).count() >= 2,
+                "{name} in header and footer:\n{out}"
+            );
+        }
+        assert!(out.contains('┆'), "dashed lifelines:\n{out}");
+        assert!(out.contains('┃'), "activation bars:\n{out}");
+        assert!(out.contains("refresh the token"), "note text:\n{out}");
+    }
+
+    #[test]
+    fn sequence_draws_one_head_per_arrow_type() {
+        const HEADS: [char; 5] = ['▶', '◀', '▷', '◁', '✕'];
+        for (op, want) in [
+            ("->>", Some('▶')),
+            ("-->>", Some('▶')),
+            ("-)", Some('▷')),
+            ("-x", Some('✕')),
+            ("->", None),
+        ] {
+            let sq = seq_of(&format!("sequenceDiagram\nA{op}B: hi"));
+            let out = render::preview_seq(&sq, 60, 12, &Opts::default());
+            let found: Vec<char> = out.chars().filter(|c| HEADS.contains(c)).collect();
+            assert_eq!(found, want.into_iter().collect::<Vec<_>>(), "{op}:\n{out}");
+            let dashed = op.starts_with("--");
+            assert_eq!(out.contains('╌'), dashed, "{op} line style:\n{out}");
+        }
+        // Right-to-left messages point the other way.
+        let sq = seq_of("sequenceDiagram\nparticipant A\nparticipant B\nB->>A: back");
+        let out = render::preview_seq(&sq, 60, 12, &Opts::default());
+        assert!(out.contains('◀') && !out.contains('▶'), "{out}");
+    }
+
+    #[test]
+    fn sequence_draws_frames_and_autonumber() {
+        let sq = seq_of(include_str!("../examples/sequence.mmd"));
+        let out = render::preview_seq(&sq, 110, 34, &Opts::default());
+        for chip in [
+            "[alt] token refreshed",
+            "[else] refresh failed",
+            "[loop] every 30s",
+        ] {
+            assert!(out.contains(chip), "{chip}:\n{out}");
+        }
+        assert!(out.contains("1. open dashboard"), "{out}");
+        assert!(out.contains("10. dashboard"), "{out}");
+        // A self-message loops back into its own lifeline.
+        assert!(out.contains('╮') && out.contains('╯'), "{out}");
+    }
+
+    #[test]
+    fn sequence_survives_tiny_areas() {
+        let sq = seq_of(include_str!("../examples/sequence.mmd"));
+        for (c, r) in [(1, 1), (2, 1), (5, 3), (12, 6), (30, 10)] {
+            let out = render::preview_seq(&sq, c, r, &Opts::default());
+            assert_eq!(out.lines().count(), r as usize);
+        }
     }
 }
