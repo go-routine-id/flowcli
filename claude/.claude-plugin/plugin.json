@@ -1,0 +1,6 @@
+{
+  "name": "flowcli",
+  "version": "0.1.0",
+  "author": { "name": "go-routine-id", "url": "https://github.com/go-routine-id/flowcli" },
+  "description": "Draw diagrams in a flowcli pane and tell Claude what you selected in them, without asking it to read the log."
+}

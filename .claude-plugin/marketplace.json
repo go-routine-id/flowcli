@@ -1,0 +1,12 @@
+{
+  "name": "flowcli",
+  "owner": { "name": "go-routine-id" },
+  "metadata": { "description": "flowcli for Claude Code: draw diagrams in a terminal pane and point at them." },
+  "plugins": [
+    {
+      "name": "flowcli",
+      "source": "./claude",
+      "description": "Draw diagrams in a flowcli pane and tell Claude what you selected in them, without asking it to read the log."
+    }
+  ]
+}

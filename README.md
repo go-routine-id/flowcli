@@ -109,6 +109,8 @@ herdr plugin install go-routine-id/flowcli/herdr
 
 See [Herdr plugin](#herdr-plugin-diagrams-next-to-your-ai-agent) for what it needs and how to use it.
 
+If that agent is Claude Code, add the [Claude Code plugin](#claude-code-plugin-the-agent-side) as well.
+
 ### Build from source
 
 ```sh
@@ -194,13 +196,30 @@ The install downloads the prebuilt release matching the checked-out `Cargo.toml`
   type = "shell"
   command = "herdr plugin action invoke open-diagram --plugin flowcli"
   ```
-- **Teach your agent**: [`herdr/skill/SKILL.md`](herdr/skill/SKILL.md) tells an agent how to draw, open the pane, check that a save parsed, and read the selection. Plugin installs don't copy skills. For Claude Code, copy it yourself:
+- **Teach your agent**: [`herdr/skill/SKILL.md`](herdr/skill/SKILL.md) tells an agent how to draw, open the pane, check that a save parsed, and read the selection. Herdr plugin installs don't copy skills. For Claude Code, install the [Claude Code plugin](#claude-code-plugin-the-agent-side) below, which brings the skill. For another agent, copy the file to wherever it reads skills from:
   ```sh
-  mkdir -p ~/.claude/skills/flowcli
-  cp "$(herdr plugin list --plugin flowcli --json | sed -n 's/.*"plugin_root":"\([^"]*\)".*/\1/p')/skill/SKILL.md" ~/.claude/skills/flowcli/
+  cp "$(herdr plugin list --plugin flowcli --json | sed -n 's/.*"plugin_root":"\([^"]*\)".*/\1/p')/skill/SKILL.md" <your agent's skills folder>/flowcli/
   ```
 
 The `.events.jsonl` and `.layout` files sit next to your diagrams; add both patterns to your project's `.gitignore`.
+
+### Claude Code plugin: the agent side
+
+The Herdr plugin gives you the pane. This one teaches Claude Code to use it. In a Claude Code session:
+
+```
+/plugin install flowcli --marketplace go-routine-id/flowcli
+```
+
+or from a shell: `claude plugin install flowcli --marketplace go-routine-id/flowcli`.
+
+It adds three things:
+
+- **The skill.** Claude knows how to draw a diagram, open the pane and check that a save parsed, with nothing to copy by hand.
+- **Your selection, passed along.** When you click a node, edge or group and then send a prompt, Claude is told what is selected. "Explain this" works without Claude reading the log first. It is told once per change, and only as background: a click never starts work on its own.
+- **`/flowcli-open [file.mmd]`** opens a diagram in a pane next to the session. Without a file it reopens the diagram Claude last wrote.
+
+The plugin doesn't draw anything itself. In a Herdr pane it opens the diagram through the [Herdr plugin](#herdr-plugin-diagrams-next-to-your-ai-agent), so install that too. Outside Herdr, `/flowcli-open` prints the `flowcli ... --watch --events ...` command to run in another terminal, and selections made there are passed along the same way. It needs `tail`, so macOS and Linux only.
 
 ## Keybindings
 
