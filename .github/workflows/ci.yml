@@ -18,3 +18,6 @@ jobs:
       # shellcheck ships on ubuntu-latest; install.sh is what users pipe into
       # bash, and the Herdr plugin scripts run on every install and pane open.
       - run: shellcheck install.sh herdr/scripts/*.sh
+      # The Claude Code plugin ships its own copy of the agent skill; an edit
+      # to one that misses the other would teach agents two different things.
+      - run: cmp herdr/skill/SKILL.md claude/skills/flowcli/SKILL.md
